@@ -42,8 +42,11 @@
  * Inside analog module, ADC data is translated from unsigned neg-slope into
  * two's complement. Similar is done on DAC data.
  *
- * Scope module stores data from ADC into RAM, arbitrary signal generator (ASG)
- * sends data from RAM to DAC. MIMO PID uses ADC ADC as input and DAC as its output.
+ * Scope module stores data from ADC into RAM. In the original Red Pitaya signal
+ * path, arbitrary signal generator (ASG) and MIMO PID can feed the DAC. In this
+ * modified file, the first butterfly-network milestone uses the two ASG
+ * waveform streams as inputs, computes sum/difference, and sends those results
+ * to the DAC.
  *
  * Daisy chain connects with other boards with fast serial link. Data which is
  * send and received is at the moment undefined. This is left for the user.
@@ -235,6 +238,13 @@ localparam type SBG_T = logic signed [ 14-1:0];  // generate
 // "negative slope" format, but most DSP/control logic wants signed values.
 SBA_T [MNA-1:0]          adc_dat;
 
+// First butterfly-network milestone output. The new module takes the two ASG
+// waveform channels and produces:
+// - butterfly_dat[0] = normalized (asg_dat[0] + asg_dat[1]) / 2
+// - butterfly_dat[1] = normalized (asg_dat[0] - asg_dat[1]) / 2
+// It is 14 bits wide so it can feed the existing DAC path directly.
+SBG_T [2-1:0]            butterfly_dat;
+
 // DAC signals
 logic                    dac_clk_1x;
 logic                    dac_clk_2x;
@@ -247,12 +257,14 @@ logic        [14-1:0] dac_dat_a, dac_dat_b;
 logic        [14-1:0] dac_a    , dac_b    ;
 logic signed [15-1:0] dac_a_sum, dac_b_sum;
 
-// ASG outputs. ASG means Arbitrary Signal Generator; these are the two waveform
-// samples produced by the generator block before they are summed with PID.
+// ASG outputs. ASG means Arbitrary Signal Generator. Software can load waveform
+// samples into memory through SCPI/API, then the ASG streams those samples out
+// here. In this milestone these two streams feed the butterfly network instead
+// of going directly to the DAC.
 SBG_T [2-1:0]            asg_dat;
 
-// PID outputs. The PID controller generates correction samples that are added
-// to the ASG samples before the final DAC conversion.
+// PID outputs. The PID controller is still instantiated and software-visible,
+// but its correction samples are bypassed by the first butterfly milestone.
 SBA_T [2-1:0]            pid_dat;
 
 // Configuration bits written by software through the housekeeping block.
@@ -565,14 +577,27 @@ end
 // DAC IO
 ////////////////////////////////////////////////////////////////////////////////
 
-// The final DAC command is the sum of two independent signal sources:
-// - ASG: waveform generated from memory
-// - PID: feedback correction based on ADC input
-//
-// The sum is 15 bits wide because adding two signed 14-bit values can overflow
-// by one bit. The next assignment saturates the result back down to 14 bits.
-assign dac_a_sum = asg_dat[0] + pid_dat[0];
-assign dac_b_sum = asg_dat[1] + pid_dat[1];
+// First butterfly-network milestone:
+// Feed the two ASG waveform channels into a small butterfly block, then send the
+// butterfly result to the DAC path. This lets software load two test waveforms
+// into ASG/RAM through SCPI/API while the FPGA hardware computes sum/difference.
+butterfly_network #(
+  .IN_DW  (14 ),
+  .OUT_DW (14 )
+) i_butterfly_network (
+  .clk_i  (adc_clk),
+  .rstn_i (adc_rstn),
+  .x0_i   (asg_dat[0]),
+  .x1_i   (asg_dat[1]),
+  .y0_o   (butterfly_dat[0]),
+  .y1_o   (butterfly_dat[1])
+);
+
+// Sign-extend the 14-bit butterfly outputs to the existing 15-bit saturation
+// stage. Keeping the saturation stage in place preserves the original DAC path
+// structure and makes later experiments easier.
+assign dac_a_sum = {butterfly_dat[0][14-1], butterfly_dat[0]};
+assign dac_b_sum = {butterfly_dat[1][14-1], butterfly_dat[1]};
 
 // Saturation limits overflow to the maximum/minimum 14-bit signed value instead
 // of wrapping around. Wrapping would turn a too-large positive value into a
@@ -590,7 +615,7 @@ assign dac_b = (^dac_b_sum[15-1:15-2]) ? {dac_b_sum[15-1], {13{~dac_b_sum[15-1]}
 //
 // digital_loop[1] provides the opposite loopback of digital_loop[0]:
 //   digital_loop[1] == 1: send ADC samples directly to DAC
-//   digital_loop[1] == 0: send the normal ASG + PID result
+//   digital_loop[1] == 0: send the butterfly-network result
 always @(posedge dac_clk_1x)
 begin // Loopback is for demonstration only. We avoid constraining for timing optimizations.
   dac_dat_a <= digital_loop[1] ? {adc_dat[0][ADW-1], ~adc_dat[0][ADW-2 -: 13]} : {dac_a[14-1], ~dac_a[14-2:0]};
@@ -850,8 +875,8 @@ i_scope (
 
 // ASG = Arbitrary Signal Generator. It reads waveform data from DDR through its
 // AXI interfaces and outputs one signed sample per channel on every dac/adc
-// clock tick. Those samples become asg_dat[0] and asg_dat[1], which are later
-// added to the PID outputs in the DAC IO section.
+// clock tick. For this first butterfly milestone, those samples feed the
+// butterfly network; the DAC receives the butterfly sum/difference results.
 red_pitaya_asg i_asg (
    // DAC
   .dac_a_o         (asg_dat[0]  ),  // CH 1
@@ -882,9 +907,10 @@ red_pitaya_asg i_asg (
 
 // PID = proportional-integral-derivative controller. "MIMO" here means the
 // block can use multiple inputs/outputs internally. From this top-level view, it
-// takes the two ADC channels and produces two signed correction signals. Those
-// correction signals are summed with the ASG waveform before going to the DAC.
-// Software configures gains and setpoints through sys[3].
+// takes the two ADC channels and produces two signed correction signals. For
+// this first butterfly milestone, those correction signals are preserved for
+// future use but bypassed by the DAC IO section. Software configures gains and
+// setpoints through sys[3].
 red_pitaya_pid i_pid (
    // signals
   .clk_i           (adc_clk   ),  // clock
