@@ -4,7 +4,7 @@
 // Engineer: Anton Potocnik
 // 
 // Create Date: 07.01.2017 22:50:51
-// Design Name: 
+// Design Name: #
 // Module Name: frequency_counter
 // Project Name: 
 // Target Devices: 
