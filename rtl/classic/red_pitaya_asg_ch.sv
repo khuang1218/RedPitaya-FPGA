@@ -92,7 +92,7 @@ module red_pitaya_asg_ch #(
 //  DAC buffer RAM
 
 wire [14-1:0] lfsr_noise;
-  rand_lfsr #(
+  rand_lfsr #(l
     .DW ( 14 ) // output data width
   )
   i_rand
@@ -102,7 +102,7 @@ wire [14-1:0] lfsr_noise;
     .init_i  (  rand_init_i), // enable
     .seed_i  (  set_seed_i ), // init value
     .dat_o   (  lfsr_noise )  // data output noise
-  );
+  );l
 
 
 localparam PNT_SIZE = RSZ+16+32;

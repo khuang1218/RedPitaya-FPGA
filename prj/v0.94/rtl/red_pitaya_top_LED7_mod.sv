@@ -238,12 +238,13 @@ localparam type SBG_T = logic signed [ 14-1:0];  // generate
 // "negative slope" format, but most DSP/control logic wants signed values.
 SBA_T [MNA-1:0]          adc_dat;
 
-// Butterfly-network output. The module treats ASG channel A as a sequence of
-// neighboring pairs and produces:
-// - butterfly_dat[0] = normalized (sample[0] + sample[1]) / 2
-// - butterfly_dat[1] = normalized (sample[0] - sample[1]) / 2
-// Then it repeats for sample[2]/sample[3], sample[4]/sample[5], and so on.
-// It is 14 bits wide so it can feed the existing DAC path directly.
+// Butterfly-network output. The module treats ASG channel A as the input vector
+// stream and ASG channel B as a packed weight stream. For each input sample,
+// ASG B carries two signed 7-bit weights:
+// - asg_dat[1][13:7] = that sample's contribution to butterfly_dat[0]
+// - asg_dat[1][ 6:0] = that sample's contribution to butterfly_dat[1]
+// The first stage consumes neighboring pairs, so every two clocks produce a
+// weighted two-output butterfly result.
 SBG_T [2-1:0]            butterfly_dat;
 
 // DAC signals
@@ -579,17 +580,19 @@ end
 ////////////////////////////////////////////////////////////////////////////////
 
 // Butterfly-network milestone:
-// Feed ASG channel A into a neighboring-pair butterfly block, then send the
-// butterfly result to the DAC path. This lets software load one test vector into
-// ASG/RAM through SCPI/API while the FPGA hardware mixes sample[0] with
-// sample[1], sample[2] with sample[3], and so on.
+// Feed ASG channel A into a neighboring-pair first-stage butterfly block and
+// use ASG channel B as the packed weight stream. This lets software load both
+// the input vector and the weights through the existing SCPI/API ASG path.
 butterfly_network #(
-  .IN_DW  (14),
-  .OUT_DW (14)
+  .IN_DW       (14),
+  .OUT_DW      (14),
+  .WEIGHT_DW   (7),
+  .WEIGHT_FRAC (6)
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
   .sample_i (asg_dat[0]),
+  .weight_i (asg_dat[1]),
   .y0_o     (butterfly_dat[0]),
   .y1_o     (butterfly_dat[1])
 );
@@ -876,8 +879,8 @@ i_scope (
 
 // ASG = Arbitrary Signal Generator. It reads waveform data from DDR through its
 // AXI interfaces and outputs one signed sample per channel on every dac/adc
-// clock tick. For this butterfly milestone, channel A feeds the neighboring-pair
-// butterfly network; the DAC receives the butterfly sum/difference results.
+// clock tick. For this butterfly milestone, channel A carries input samples and
+// channel B carries two packed 7-bit weights per input sample.
 red_pitaya_asg i_asg (
    // DAC
   .dac_a_o         (asg_dat[0]  ),  // CH 1
