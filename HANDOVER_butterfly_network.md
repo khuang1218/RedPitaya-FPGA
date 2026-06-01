@@ -25,7 +25,8 @@ PC / SCPI / API
   -> ASG channel A waveform memory: input vector samples
   -> ASG channel B waveform memory: packed butterfly weights
   -> ASG streams asg_dat[0], asg_dat[1]
-  -> butterfly_network
+  -> butterfly_network local sample/weight RAM capture
+  -> one RAM-to-RAM neighboring-pair butterfly stage
   -> butterfly_dat[0], butterfly_dat[1]
   -> existing DAC format/output path
   -> DAC OUT1, DAC OUT2
@@ -33,7 +34,7 @@ PC / SCPI / API
 
 The normal Red Pitaya ASG still exists and is still configured by software, but both ASG streams are intercepted before the physical DAC output.
 
-The current butterfly behavior is a weighted first-stage neighboring-pair butterfly. ASG channel A carries the input vector:
+The current butterfly behavior is a RAM-backed weighted first-stage neighboring-pair butterfly. ASG channel A carries the input vector:
 
 ```text
 input stream:
@@ -47,7 +48,7 @@ w[n][13:7] = signed 7-bit Q1.6 weight for DAC OUT1 / y0
 w[n][ 6:0] = signed 7-bit Q1.6 weight for DAC OUT2 / y1
 ```
 
-For each neighboring pair:
+The FPGA captures `VECTOR_LEN` samples and `VECTOR_LEN` packed weight words into local RAM, then computes each neighboring pair:
 
 ```text
 pair 0:
@@ -59,7 +60,7 @@ pair 1:
   y1 = x[2] * w[2].y1 + x[3] * w[3].y1
 ```
 
-After multiply/add, the accumulator is shifted right by 6 bits to convert the Q1.6 weighted result back to sample scale, then saturated to 14 bits.
+After multiply/add, the accumulator is shifted right by 6 bits to convert the Q1.6 weighted result back to sample scale, then saturated to 14 bits. Pair outputs are written into local output RAMs and then played back to the DAC, one pair per clock.
 
 This implements the "two weights per input element" idea while using the two existing ASG channels:
 
@@ -89,10 +90,12 @@ module butterfly_network #(
   parameter int unsigned IN_DW  = 14,
   parameter int unsigned OUT_DW = 14,
   parameter int unsigned WEIGHT_DW   = 7,
-  parameter int unsigned WEIGHT_FRAC = 6
+  parameter int unsigned WEIGHT_FRAC = 6,
+  parameter int unsigned VECTOR_LEN  = 1024
 )(
   input  logic                     clk_i,
   input  logic                     rstn_i,
+  input  logic                     start_i,
 
   input  logic signed [IN_DW-1:0]  sample_i,
   input  logic signed [2*WEIGHT_DW-1:0] weight_i,
@@ -109,14 +112,18 @@ IN_DW       = 14
 OUT_DW      = 14
 WEIGHT_DW   = 7
 WEIGHT_FRAC = 6
+VECTOR_LEN  = 1024
 ```
 
 Internal behavior:
 
-- Stores the first/even sample of a pair in `first_sample`.
-- Stores the two signed 7-bit weights that arrive with the first/even sample.
-- Uses `pair_phase` to track whether the next sample is first or second in the pair.
-- On the second/odd sample, unpacks that sample's two weights and computes:
+- `ST_IDLE`: waits for `start_i`, currently connected to the ASG trigger notification pulse.
+- `ST_CAPTURE`: stores ASG A samples into `sample_ram` and ASG B packed weights into `weight_ram`.
+- `ST_COMPUTE_READ`: reads two neighboring samples and their two packed weight words from RAM.
+- `ST_COMPUTE_WRITE`: computes one weighted butterfly pair and writes `y0_ram` / `y1_ram`.
+- `ST_PLAYBACK`: loops over the completed pair-output RAMs and drives DAC OUT1 / DAC OUT2.
+
+For each pair it computes:
 
 ```systemverilog
 y0 = first_sample * first_weight_y0 + sample_i * weight_y0;
@@ -126,8 +133,7 @@ y1_scaled = y1 >>> WEIGHT_FRAC;
 ```
 
 - Saturates the scaled results to `OUT_DW`.
-- Outputs update only when a full pair is available.
-- Outputs hold their previous value during the first sample of the next pair.
+- Output playback starts only after the whole captured vector has been processed.
 
 ### `prj/v0.94/rtl/red_pitaya_top_LED7_mod.sv`
 
@@ -146,10 +152,12 @@ butterfly_network #(
   .IN_DW       (14),
   .OUT_DW      (14),
   .WEIGHT_DW   (7),
-  .WEIGHT_FRAC (6)
+  .WEIGHT_FRAC (6),
+  .VECTOR_LEN  (1024)
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
+  .start_i  (trig_asg_out),
   .sample_i (asg_dat[0]),
   .weight_i (asg_dat[1]),
   .y0_o     (butterfly_dat[0]),
@@ -178,9 +186,11 @@ This means the DAC physical outputs now come from the butterfly result, not dire
 - The input vector is currently `asg_dat[0]`, meaning ASG channel A.
 - The weight stream is currently `asg_dat[1]`, meaning ASG channel B.
 - Each 14-bit ASG-B sample packs two signed 7-bit Q1.6 weights.
-- The module processes neighboring samples in time, not two separate input-vector channels.
-- Use an even number of waveform samples for clean repeated testing.
-- Because outputs update once per pair, the effective output update rate is half the input sample-pair rate.
+- `VECTOR_LEN` must be even. Current top-level value is 1024.
+- The module waits for ASG trigger notification, captures one vector, computes one full neighboring-pair stage, then loops playback of the result.
+- The module processes neighboring samples from RAM, not two separate input-vector channels.
+- Use an ASG waveform length and generator configuration that repeatedly presents the intended first `VECTOR_LEN` samples after reset/trigger.
+- During output playback, DAC OUT1/DAC OUT2 update once per computed pair.
 - Weight scaling is fixed by `WEIGHT_FRAC = 6`, so a weight value of `63` represents approximately `+0.984375`, and `-64` represents `-1.0`.
 - There is no runtime SCPI-configurable weight/register yet.
 - The design uses the existing ASG waveform memories as the temporary software-loaded weight source.

@@ -580,17 +580,19 @@ end
 ////////////////////////////////////////////////////////////////////////////////
 
 // Butterfly-network milestone:
-// Feed ASG channel A into a neighboring-pair first-stage butterfly block and
-// use ASG channel B as the packed weight stream. This lets software load both
-// the input vector and the weights through the existing SCPI/API ASG path.
+// Capture ASG channel A and packed ASG channel B weights into local RAM, then
+// run one neighboring-pair first-stage butterfly from RAM to RAM. The completed
+// pair outputs are played back to the DAC.
 butterfly_network #(
   .IN_DW       (14),
   .OUT_DW      (14),
   .WEIGHT_DW   (7),
-  .WEIGHT_FRAC (6)
+  .WEIGHT_FRAC (6),
+  .VECTOR_LEN  (1024)
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
+  .start_i  (trig_asg_out),
   .sample_i (asg_dat[0]),
   .weight_i (asg_dat[1]),
   .y0_o     (butterfly_dat[0]),
@@ -661,6 +663,9 @@ logic [DWE-1: 0] exp_p_altd, exp_n_altd;
 
 logic [8-1:0] led_hk;
 logic [26-1:0] fpga_marker_cnt;
+logic [8-1:0] bnet_led_debug;
+logic         bnet_led_debug_en;
+logic         bnet_led6_heartbeat_en;
 
 // Housekeeping contains low-rate control/status registers: LEDs, GPIO direction
 // and output data, digital loopback modes, daisy-chain mode bits, and CAN enable.
@@ -710,10 +715,14 @@ always_ff @(posedge adc_clk) begin
         fpga_marker_cnt <= fpga_marker_cnt + 1'b1;
 end
 
-// LEDs 0..6 still come from the housekeeping block, so software or existing Red
-// Pitaya status logic can control them. LED 7 is overridden with the heartbeat.
-assign led_o[6:0] = led_hk[6:0];
-assign led_o[7]   = fpga_marker_cnt[25];
+// By default LEDs 0..5 still come from housekeeping and LED 7 is a heartbeat.
+// BNET_CONTROL[3] enables a visible heartbeat on LED6; clearing it drives LED6
+// low. When BNET_CONTROL[2] is set, the BNET register block drives all LED bits
+// with CH0[7:0] so direct ARM-to-FPGA register writes are visible on the board.
+assign led_o = bnet_led_debug_en ? bnet_led_debug
+                                : {fpga_marker_cnt[25],
+                                   bnet_led6_heartbeat_en ? fpga_marker_cnt[25] : 1'b0,
+                                   led_hk[5:0]};
 
 ////////////////////////////////////////////////////////////////////////////////
 // GPIO
@@ -1042,9 +1051,23 @@ red_pitaya_daisy  #(
   sys_bus_stub sys_bus_stub_6 (sys[6]);
   `endif
 
-  // sys[7] is unused in this design. A stub acknowledges bus accesses and
-  // returns harmless values.
-  sys_bus_stub sys_bus_stub_7 (sys[7]);
+  // sys[7] is the custom butterfly-network scalar register block. With SW=20
+  // in the interconnect above, this occupies the 0x0070_0000 FPGA bus region
+  // relative to the /dev/uio/api map used by Red Pitaya software.
+  bnet_regs i_bnet_regs (
+    .clk_i          (adc_clk         ),
+    .rstn_i         (adc_rstn        ),
+    .sys_addr_i     (sys[7].addr     ),
+    .sys_wdata_i    (sys[7].wdata    ),
+    .sys_wen_i      (sys[7].wen      ),
+    .sys_ren_i      (sys[7].ren      ),
+    .sys_rdata_o    (sys[7].rdata    ),
+    .sys_err_o      (sys[7].err      ),
+    .sys_ack_o      (sys[7].ack      ),
+    .led_debug_o    (bnet_led_debug  ),
+    .led_debug_en_o (bnet_led_debug_en),
+    .led6_heartbeat_en_o (bnet_led6_heartbeat_en)
+  );
 
 `else
 // SCOPE_ONLY build option:
