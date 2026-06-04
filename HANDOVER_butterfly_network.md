@@ -1,5 +1,46 @@
 # Red Pitaya Butterfly Network Handover
 
+## Current Status Update - 2026-06-04
+
+This file originally described the first ASG-fed butterfly milestone. The
+hardware has since advanced to a DDR-backed BNET reader prototype.
+
+For the most current compile-check handover, use:
+
+```text
+HANDOVER_bnet_ddr_reader_compile_check.md
+```
+
+That newer handover covers:
+
+- BNET input source selection through `CONFIG[1:0]`.
+- ADC, ASG-test, and DDR-stream BNET input modes.
+- The new `bnet_axi_reader_ch.sv` DDR reader.
+- Use of `axi2_sys` and `axi3_sys` for BNET streams 0 and 1.
+- ASG deep-memory AXI stubbing while preserving normal ASG BRAM/table mode.
+- Reader consume/valid handshaking for sample/weight alignment.
+- Read-pointer and runtime-error feedback into `bnet_regs`.
+
+The current signal-chain target is:
+
+```text
+ADC or ASG test input or DDR stream input
+  -> BNET compute block
+  -> DAC output path
+```
+
+Relevant current hardware files:
+
+```text
+prj/v0.94/rtl/bnet_regs.sv
+prj/v0.94/rtl/butterfly_network.sv
+prj/v0.94/rtl/bnet_axi_reader_ch.sv
+prj/v0.94/rtl/red_pitaya_top_LED7_mod.sv
+```
+
+Use Vivado 2020.1 for the first real compile/synthesis check. No Vivado compile
+was run on the PC where these edits were made.
+
 ## Project Context
 
 Repository/workspace:

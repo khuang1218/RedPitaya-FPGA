@@ -37,6 +37,7 @@ module butterfly_network #(
   input  logic                         clk_i,
   input  logic                         rstn_i,
   input  logic                         start_i,
+  input  logic                         input_valid_i,
 
   input  logic signed [IN_DW-1:0]      sample_i,
   input  logic signed [2*WEIGHT_DW-1:0] weight_i,
@@ -172,15 +173,17 @@ module butterfly_network #(
         end
 
         ST_CAPTURE: begin
-          sample_ram[capture_addr] <= sample_i;
-          weight_ram[capture_addr] <= weight_i;
+          if (input_valid_i) begin
+            sample_ram[capture_addr] <= sample_i;
+            weight_ram[capture_addr] <= weight_i;
 
-          if (capture_addr == LAST_CAPTURE_ADDR) begin
-            capture_addr      <= '0;
-            compute_pair_addr <= '0;
-            state             <= ST_COMPUTE_READ;
-          end else begin
-            capture_addr <= capture_addr + 1'b1;
+            if (capture_addr == LAST_CAPTURE_ADDR) begin
+              capture_addr      <= '0;
+              compute_pair_addr <= '0;
+              state             <= ST_COMPUTE_READ;
+            end else begin
+              capture_addr <= capture_addr + 1'b1;
+            end
           end
         end
 

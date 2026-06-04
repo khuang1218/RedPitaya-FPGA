@@ -233,6 +233,7 @@ logic                 can_on;
 // types keeps all channel arrays consistently sized.
 localparam type SBA_T = logic signed [ADW-1:0];  // acquire
 localparam type SBG_T = logic signed [ 14-1:0];  // generate
+localparam int unsigned BNET_STREAM_COUNT = 8;
 
 // Converted ADC samples used inside the FPGA. The raw ADC pins are unsigned
 // "negative slope" format, but most DSP/control logic wants signed values.
@@ -246,6 +247,30 @@ SBA_T [MNA-1:0]          adc_dat;
 // The first stage consumes neighboring pairs, so every two clocks produce a
 // weighted two-output butterfly result.
 SBG_T [2-1:0]            butterfly_dat;
+SBG_T                    bnet_sample_dat;
+logic signed [14-1:0]    bnet_weight_dat;
+logic [2-1:0]            bnet_input_sel;
+logic                    bnet_start_pulse;
+logic                    bnet_start;
+logic                    bnet_input_valid;
+logic signed [14-1:0]    bnet_ddr_sample_dat;
+logic signed [14-1:0]    bnet_ddr_weight_dat;
+logic                    bnet_ddr_sample_valid;
+logic                    bnet_ddr_weight_valid;
+logic                    bnet_ddr_pair_valid;
+logic [32-1:0]           bnet_ddr_sample_rptr;
+logic [32-1:0]           bnet_ddr_weight_rptr;
+logic                    bnet_ddr_sample_underrun;
+logic                    bnet_ddr_weight_underrun;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_base0;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_base1;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_length;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_stride;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_format;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_read_ptr;
+logic [BNET_STREAM_COUNT-1:0]          bnet_stream_enable;
+logic [BNET_STREAM_COUNT-1:0]          bnet_stream_active_buf;
+logic [BNET_STREAM_COUNT-1:0]          bnet_stream_runtime_error;
 
 // DAC signals
 logic                    dac_clk_1x;
@@ -290,6 +315,35 @@ axi_sys_if axi0_sys (.clk(adc_clk    ), .rstn(adc_rstn    ));
 axi_sys_if axi1_sys (.clk(adc_clk    ), .rstn(adc_rstn    ));
 axi_sys_if axi2_sys (.clk(dac_axi_clk), .rstn(dac_axi_rstn));
 axi_sys_if axi3_sys (.clk(dac_axi_clk), .rstn(dac_axi_rstn));
+axi_sys_if asg_axi_a_dummy (.clk(dac_axi_clk), .rstn(dac_axi_rstn));
+axi_sys_if asg_axi_b_dummy (.clk(dac_axi_clk), .rstn(dac_axi_rstn));
+
+assign asg_axi_a_dummy.werr  = 1'b0;
+assign asg_axi_a_dummy.wrdy  = 1'b1;
+assign asg_axi_a_dummy.rdata = 64'd0;
+assign asg_axi_a_dummy.rerr  = 1'b0;
+assign asg_axi_a_dummy.rrdym = 1'b1;
+assign asg_axi_a_dummy.rardy = 1'b1;
+assign asg_axi_b_dummy.werr  = 1'b0;
+assign asg_axi_b_dummy.wrdy  = 1'b1;
+assign asg_axi_b_dummy.rdata = 64'd0;
+assign asg_axi_b_dummy.rerr  = 1'b0;
+assign asg_axi_b_dummy.rrdym = 1'b1;
+assign asg_axi_b_dummy.rardy = 1'b1;
+assign bnet_ddr_pair_valid = bnet_ddr_sample_valid && bnet_ddr_weight_valid;
+assign bnet_stream_read_ptr[0] = bnet_ddr_sample_rptr;
+assign bnet_stream_read_ptr[1] = bnet_ddr_weight_rptr;
+assign bnet_stream_runtime_error = {
+  {(BNET_STREAM_COUNT-2){1'b0}},
+  bnet_ddr_weight_underrun,
+  bnet_ddr_sample_underrun
+};
+
+generate
+for (genvar BNET_RPTR_IDX = 2; BNET_RPTR_IDX < BNET_STREAM_COUNT; BNET_RPTR_IDX++) begin : bnet_unused_rptr
+  assign bnet_stream_read_ptr[BNET_RPTR_IDX] = 32'd0;
+end
+endgenerate
 ////////////////////////////////////////////////////////////////////////////////
 // PLL (clock and reset)
 ////////////////////////////////////////////////////////////////////////////////
@@ -579,10 +633,84 @@ end
 // DAC IO
 ////////////////////////////////////////////////////////////////////////////////
 
+// BNET DDR streams. Stream 0 is the sample/input stream and stream 1 is the
+// packed-weight stream. They use the two PS HP ports that normally back ASG
+// deep-memory generation; normal ASG table mode remains available through BRAM.
+bnet_axi_reader_ch #(
+  .SAMPLE_DW (14)
+) i_bnet_sample_reader (
+  .cfg_clk_i      (adc_clk),
+  .cfg_rstn_i     (adc_rstn),
+  .start_i        (bnet_start_pulse && (bnet_input_sel == 2'd2)),
+  .enable_i       (bnet_stream_enable[0]),
+  .active_buf_i   (bnet_stream_active_buf[0]),
+  .base0_i        (bnet_stream_base0[0]),
+  .base1_i        (bnet_stream_base1[0]),
+  .length_bytes_i (bnet_stream_length[0]),
+  .stride_bytes_i (bnet_stream_stride[0]),
+  .consume_i      (bnet_ddr_pair_valid),
+  .axi_sys        (axi2_sys),
+  .sample_o       (bnet_ddr_sample_dat),
+  .valid_o        (bnet_ddr_sample_valid),
+  .ready_o        (),
+  .read_ptr_o     (bnet_ddr_sample_rptr),
+  .underrun_o     (bnet_ddr_sample_underrun)
+);
+
+bnet_axi_reader_ch #(
+  .SAMPLE_DW (14)
+) i_bnet_weight_reader (
+  .cfg_clk_i      (adc_clk),
+  .cfg_rstn_i     (adc_rstn),
+  .start_i        (bnet_start_pulse && (bnet_input_sel == 2'd2)),
+  .enable_i       (bnet_stream_enable[1]),
+  .active_buf_i   (bnet_stream_active_buf[1]),
+  .base0_i        (bnet_stream_base0[1]),
+  .base1_i        (bnet_stream_base1[1]),
+  .length_bytes_i (bnet_stream_length[1]),
+  .stride_bytes_i (bnet_stream_stride[1]),
+  .consume_i      (bnet_ddr_pair_valid),
+  .axi_sys        (axi3_sys),
+  .sample_o       (bnet_ddr_weight_dat),
+  .valid_o        (bnet_ddr_weight_valid),
+  .ready_o        (),
+  .read_ptr_o     (bnet_ddr_weight_rptr),
+  .underrun_o     (bnet_ddr_weight_underrun)
+);
+
+// Select the butterfly input source.
+//   0: ASG test stream. ASG A carries samples and ASG B carries packed weights.
+//   1: ADC real-time stream. ADC A carries samples; ASG B still carries packed
+//      weights until the dedicated weight/DDR reader is wired in.
+//   2: reserved for the upcoming DDR-backed BNET stream reader.
+always_comb begin
+  bnet_sample_dat = asg_dat[0];
+  bnet_weight_dat = asg_dat[1];
+  bnet_start = trig_asg_out;
+  bnet_input_valid = 1'b1;
+
+  unique case (bnet_input_sel)
+    2'd1: begin
+      bnet_sample_dat = adc_dat[0][14-1:0];
+      bnet_weight_dat = asg_dat[1];
+    end
+    2'd2: begin
+      bnet_sample_dat = bnet_ddr_sample_dat;
+      bnet_weight_dat = bnet_ddr_weight_dat;
+      bnet_start = bnet_start_pulse;
+      bnet_input_valid = bnet_ddr_pair_valid;
+    end
+    default: begin
+      bnet_sample_dat = asg_dat[0];
+      bnet_weight_dat = asg_dat[1];
+    end
+  endcase
+end
+
 // Butterfly-network milestone:
-// Capture ASG channel A and packed ASG channel B weights into local RAM, then
-// run one neighboring-pair first-stage butterfly from RAM to RAM. The completed
-// pair outputs are played back to the DAC.
+// Capture the selected sample stream and packed weight stream into local RAM,
+// then run one neighboring-pair first-stage butterfly from RAM to RAM. The
+// completed pair outputs are played back to the DAC.
 butterfly_network #(
   .IN_DW       (14),
   .OUT_DW      (14),
@@ -592,9 +720,10 @@ butterfly_network #(
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
-  .start_i  (trig_asg_out),
-  .sample_i (asg_dat[0]),
-  .weight_i (asg_dat[1]),
+  .start_i  (bnet_start),
+  .input_valid_i (bnet_input_valid),
+  .sample_i (bnet_sample_dat),
+  .weight_i (bnet_weight_dat),
   .y0_o     (butterfly_dat[0]),
   .y1_o     (butterfly_dat[1])
 );
@@ -901,9 +1030,10 @@ red_pitaya_asg i_asg (
   // trig_out_o can be routed back into the scope or out to GPIO/daisy logic.
   .trig_out_o      (trig_asg_out),
 
-  // Waveform memory access. These AXI ports let the ASG fetch samples from DDR.
-  .axi_a_sys       (axi2_sys    ),
-  .axi_b_sys       (axi3_sys    ),
+  // Normal ASG table mode uses local BRAM. The real DDR HP ports are reserved
+  // for BNET in this build, so ASG deep-memory AXI is intentionally stubbed.
+  .axi_a_sys       (asg_axi_a_dummy),
+  .axi_b_sys       (asg_axi_b_dummy),
   // System bus
   .sys_addr        (sys[2].addr ),
   .sys_wdata       (sys[2].wdata),
@@ -1054,7 +1184,9 @@ red_pitaya_daisy  #(
   // sys[7] is the custom butterfly-network scalar register block. With SW=20
   // in the interconnect above, this occupies the 0x0070_0000 FPGA bus region
   // relative to the /dev/uio/api map used by Red Pitaya software.
-  bnet_regs i_bnet_regs (
+  bnet_regs #(
+    .STREAM_COUNT (BNET_STREAM_COUNT)
+  ) i_bnet_regs (
     .clk_i          (adc_clk         ),
     .rstn_i         (adc_rstn        ),
     .sys_addr_i     (sys[7].addr     ),
@@ -1066,7 +1198,18 @@ red_pitaya_daisy  #(
     .sys_ack_o      (sys[7].ack      ),
     .led_debug_o    (bnet_led_debug  ),
     .led_debug_en_o (bnet_led_debug_en),
-    .led6_heartbeat_en_o (bnet_led6_heartbeat_en)
+    .led6_heartbeat_en_o (bnet_led6_heartbeat_en),
+    .input_sel_o    (bnet_input_sel),
+    .start_pulse_o  (bnet_start_pulse),
+    .stream_base0_o (bnet_stream_base0),
+    .stream_base1_o (bnet_stream_base1),
+    .stream_length_o(bnet_stream_length),
+    .stream_stride_o(bnet_stream_stride),
+    .stream_format_o(bnet_stream_format),
+    .stream_enable_o(bnet_stream_enable),
+    .stream_active_buf_o(bnet_stream_active_buf),
+    .stream_read_ptr_i(bnet_stream_read_ptr),
+    .stream_runtime_error_i(bnet_stream_runtime_error)
   );
 
 `else
