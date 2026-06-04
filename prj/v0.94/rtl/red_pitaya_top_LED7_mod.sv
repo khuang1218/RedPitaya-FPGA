@@ -252,12 +252,17 @@ logic signed [14-1:0]    bnet_weight_dat;
 logic [2-1:0]            bnet_input_sel;
 logic                    bnet_start_pulse;
 logic                    bnet_start;
-logic                    bnet_input_valid;
+logic                    bnet_sample_valid;
+logic                    bnet_weight_valid;
+logic                    bnet_sample_ready;
+logic                    bnet_weight_ready;
+logic                    bnet_output_valid;
+logic                    bnet_busy;
+logic                    bnet_done;
 logic signed [14-1:0]    bnet_ddr_sample_dat;
 logic signed [14-1:0]    bnet_ddr_weight_dat;
 logic                    bnet_ddr_sample_valid;
 logic                    bnet_ddr_weight_valid;
-logic                    bnet_ddr_pair_valid;
 logic [32-1:0]           bnet_ddr_sample_rptr;
 logic [32-1:0]           bnet_ddr_weight_rptr;
 logic                    bnet_ddr_sample_underrun;
@@ -330,7 +335,6 @@ assign asg_axi_b_dummy.rdata = 64'd0;
 assign asg_axi_b_dummy.rerr  = 1'b0;
 assign asg_axi_b_dummy.rrdym = 1'b1;
 assign asg_axi_b_dummy.rardy = 1'b1;
-assign bnet_ddr_pair_valid = bnet_ddr_sample_valid && bnet_ddr_weight_valid;
 assign bnet_stream_read_ptr[0] = bnet_ddr_sample_rptr;
 assign bnet_stream_read_ptr[1] = bnet_ddr_weight_rptr;
 assign bnet_stream_runtime_error = {
@@ -648,7 +652,7 @@ bnet_axi_reader_ch #(
   .base1_i        (bnet_stream_base1[0]),
   .length_bytes_i (bnet_stream_length[0]),
   .stride_bytes_i (bnet_stream_stride[0]),
-  .consume_i      (bnet_ddr_pair_valid),
+  .consume_i      ((bnet_input_sel == 2'd2) && bnet_sample_ready && bnet_ddr_sample_valid),
   .axi_sys        (axi2_sys),
   .sample_o       (bnet_ddr_sample_dat),
   .valid_o        (bnet_ddr_sample_valid),
@@ -669,7 +673,7 @@ bnet_axi_reader_ch #(
   .base1_i        (bnet_stream_base1[1]),
   .length_bytes_i (bnet_stream_length[1]),
   .stride_bytes_i (bnet_stream_stride[1]),
-  .consume_i      (bnet_ddr_pair_valid),
+  .consume_i      ((bnet_input_sel == 2'd2) && bnet_weight_ready && bnet_ddr_weight_valid),
   .axi_sys        (axi3_sys),
   .sample_o       (bnet_ddr_weight_dat),
   .valid_o        (bnet_ddr_weight_valid),
@@ -687,7 +691,8 @@ always_comb begin
   bnet_sample_dat = asg_dat[0];
   bnet_weight_dat = asg_dat[1];
   bnet_start = trig_asg_out;
-  bnet_input_valid = 1'b1;
+  bnet_sample_valid = 1'b1;
+  bnet_weight_valid = 1'b1;
 
   unique case (bnet_input_sel)
     2'd1: begin
@@ -698,7 +703,8 @@ always_comb begin
       bnet_sample_dat = bnet_ddr_sample_dat;
       bnet_weight_dat = bnet_ddr_weight_dat;
       bnet_start = bnet_start_pulse;
-      bnet_input_valid = bnet_ddr_pair_valid;
+      bnet_sample_valid = bnet_ddr_sample_valid;
+      bnet_weight_valid = bnet_ddr_weight_valid;
     end
     default: begin
       bnet_sample_dat = asg_dat[0];
@@ -708,9 +714,9 @@ always_comb begin
 end
 
 // Butterfly-network milestone:
-// Capture the selected sample stream and packed weight stream into local RAM,
-// then run one neighboring-pair first-stage butterfly from RAM to RAM. The
-// completed pair outputs are played back to the DAC.
+// Capture the selected input vector and full per-stage weight stream into local
+// RAM, then run all fixed-point butterfly stages from RAM bank to RAM bank. The
+// completed vector is played back to the DAC two samples at a time.
 butterfly_network #(
   .IN_DW       (14),
   .OUT_DW      (14),
@@ -721,11 +727,17 @@ butterfly_network #(
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
   .start_i  (bnet_start),
-  .input_valid_i (bnet_input_valid),
+  .sample_valid_i (bnet_sample_valid),
+  .sample_ready_o (bnet_sample_ready),
   .sample_i (bnet_sample_dat),
+  .weight_valid_i (bnet_weight_valid),
+  .weight_ready_o (bnet_weight_ready),
   .weight_i (bnet_weight_dat),
   .y0_o     (butterfly_dat[0]),
-  .y1_o     (butterfly_dat[1])
+  .y1_o     (butterfly_dat[1]),
+  .output_valid_o (bnet_output_valid),
+  .busy_o   (bnet_busy),
+  .done_o   (bnet_done)
 );
 
 // Sign-extend the 14-bit butterfly outputs to the existing 15-bit saturation
@@ -1201,6 +1213,9 @@ red_pitaya_daisy  #(
     .led6_heartbeat_en_o (bnet_led6_heartbeat_en),
     .input_sel_o    (bnet_input_sel),
     .start_pulse_o  (bnet_start_pulse),
+    .compute_busy_i (bnet_busy),
+    .compute_done_i (bnet_done),
+    .compute_output_valid_i (bnet_output_valid),
     .stream_base0_o (bnet_stream_base0),
     .stream_base1_o (bnet_stream_base1),
     .stream_length_o(bnet_stream_length),

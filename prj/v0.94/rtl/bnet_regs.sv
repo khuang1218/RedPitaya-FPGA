@@ -65,6 +65,9 @@ module bnet_regs #(
   output logic          led6_heartbeat_en_o,
   output logic [ 2-1:0] input_sel_o,
   output logic          start_pulse_o,
+  input  logic          compute_busy_i,
+  input  logic          compute_done_i,
+  input  logic          compute_output_valid_i,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base0_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base1_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_length_o,
@@ -189,10 +192,13 @@ module bnet_regs #(
       end
     end else begin
       start_pulse_o <= 1'b0;
-      status_reg[0] <= 1'b0; // busy: this scalar test completes immediately.
+      status_reg[0] <= compute_busy_i;
+      if (compute_done_i) begin
+        status_reg[1] <= 1'b1;
+      end
       status_reg[2] <= 1'b0; // error: reserved for later buffer/controller work.
       status_reg[3] <= |stream_pending_valid;
-      status_reg[4] <= control_reg[4];
+      status_reg[4] <= compute_output_valid_i;
 
       if (sys_wen_i) begin
         case (sys_addr_i[19:0])
@@ -222,7 +228,7 @@ module bnet_regs #(
               control_reg <= sys_wdata_i;
               if (sys_wdata_i[0]) begin
                 start_pulse_o <= 1'b1;
-                status_reg[1] <= 1'b1;
+                status_reg[1] <= 1'b0;
                 for (int i = 0; i < STREAM_COUNT; i++) begin
                   if (stream_pending_valid[i]) begin
                     stream_active_buf[i] <= stream_pending_buf[i];

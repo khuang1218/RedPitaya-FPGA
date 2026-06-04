@@ -196,28 +196,106 @@ Important implementation details:
   both readers are valid. This keeps sample and weight streams aligned across
   ordinary AXI latency/skew.
 
-## Butterfly Network Change
+## Full Staged Butterfly Network Change
 
-`butterfly_network.sv` gained:
+`butterfly_network.sv` has been replaced with a staged fixed-point butterfly
+engine. It is intentionally serial rather than fully parallel for this first
+full-network hardware pass.
 
-```systemverilog
-input logic input_valid_i
+Default build shape:
+
+```text
+VECTOR_LEN = 1024
+STAGE_COUNT = log2(VECTOR_LEN) = 10
+PAIR_COUNT = VECTOR_LEN / 2 = 512 butterflies per stage
+TOTAL_WEIGHTS = STAGE_COUNT * VECTOR_LEN = 10240 packed weight words
 ```
 
-Capture only advances when `input_valid_i` is high.
+Each packed weight word is still 14 bits:
+
+```text
+weight[13:7] = contribution to first butterfly output
+weight[ 6:0] = contribution to second butterfly output
+```
+
+With the default parameters those are two signed 7-bit Q1.6 weights.
+
+The engine does:
+
+```text
+1. Load VECTOR_LEN input samples into bank0 RAM.
+2. Load STAGE_COUNT * VECTOR_LEN packed weight words into weight RAM.
+3. For each stage:
+   - route pairs using radix-2 butterfly addressing
+   - read two samples from the current bank
+   - read two packed weight words for that stage/pair
+   - compute two weighted outputs
+   - round back to sample scale
+   - saturate to signed 14-bit
+   - write into the opposite bank
+4. Toggle banks between stages.
+5. Play the final vector back to DAC A/B two samples per clock.
+```
+
+The module interface changed from one combined valid signal to independent
+sample and weight handshakes:
+
+```systemverilog
+input  logic sample_valid_i
+output logic sample_ready_o
+
+input  logic weight_valid_i
+output logic weight_ready_o
+
+output logic output_valid_o
+output logic busy_o
+output logic done_o
+```
 
 Reason:
 
-- ASG/ADC modes are effectively valid every clock.
-- DDR mode can stall because AXI/FIFO data is not guaranteed every clock.
-- Without `input_valid_i`, DDR latency would corrupt the captured vector.
+- A full network needs only `VECTOR_LEN` input samples.
+- It needs `VECTOR_LEN * log2(VECTOR_LEN)` weight words.
+- DDR stream 0 and stream 1 therefore need different lengths and independent
+  consume signals.
+- The old `sample_valid && weight_valid` consume rule would force the sample
+  stream to contain dummy samples for every extra weight word.
 
 Top-level behavior:
 
 ```text
-ASG mode: input_valid_i = 1
-ADC mode: input_valid_i = 1
-DDR mode: input_valid_i = sample_valid && weight_valid
+ASG mode: sample_valid_i = 1, weight_valid_i = 1
+ADC mode: sample_valid_i = 1, weight_valid_i = 1
+DDR mode: sample_valid_i = stream0 valid, weight_valid_i = stream1 valid
+```
+
+DDR reader consume behavior now follows the network ready signals:
+
+```text
+stream 0 consume = DDR mode && sample_ready_o && stream0 valid
+stream 1 consume = DDR mode && weight_ready_o && stream1 valid
+```
+
+So for a real full-network DDR test:
+
+```text
+stream 0 length = VECTOR_LEN * 2 bytes
+stream 1 length = VECTOR_LEN * log2(VECTOR_LEN) * 2 bytes
+```
+
+For `VECTOR_LEN=1024`:
+
+```text
+stream 0 length = 2048 bytes
+stream 1 length = 20480 bytes
+```
+
+`bnet_regs.sv` now receives compute status from the butterfly engine:
+
+```text
+STATUS[0] = busy
+STATUS[1] = done, sticky until next START/reset
+STATUS[4] = output playback valid
 ```
 
 ## Compile Check Required
@@ -314,15 +392,42 @@ sample_o <= word_data[(lane_index * 16) +: SAMPLE_DW];
 
 Vivado should support variable indexed part-select. If it does not in this context, replace with a `case(lane_index)`.
 
-6. New `input_valid_i` port
+6. Updated `butterfly_network` handshake ports
 
-There is only one `butterfly_network` instantiation:
+This item is superseded by the full-network interface. There is only one
+`butterfly_network` instantiation:
 
 ```text
 prj/v0.94/rtl/red_pitaya_top_LED7_mod.sv
 ```
 
-Confirm Vivado sees the updated module and port list.
+Confirm Vivado sees the updated module and these ports:
+
+```text
+sample_valid_i, sample_ready_o
+weight_valid_i, weight_ready_o
+output_valid_o, busy_o, done_o
+```
+
+8. Full-network RAM inference
+
+`butterfly_network.sv` now contains:
+
+```text
+bank0_ram: 1024 x 14
+bank1_ram: 1024 x 14
+weight_ram: 10240 x 14
+```
+
+Vivado should infer BRAM or distributed RAM. Check utilization. If it maps too
+much weight storage into LUT RAM, add RAM style attributes or split weight RAM
+by stage.
+
+9. Local declarations and casts in `always_comb`
+
+The staged engine uses SystemVerilog local variables inside `always_comb` and
+parameter-sized concatenations. Vivado 2020.1 should support this, but this is a
+good first syntax-check target.
 
 7. ASG deep-memory behavior
 
@@ -409,10 +514,17 @@ After Vivado compile succeeds and software support is added or register writes a
 ## Known Incomplete Items
 
 - No Vivado compile/synthesis has been run yet.
-- No software API/SCPI has been updated for `CONFIG` or stream descriptors yet.
+- The software/API/SCPI stream descriptors exist, but the notebook/proper BNET
+  correctness test must now upload `VECTOR_LEN * log2(VECTOR_LEN)` weight words
+  for stream 1.
 - `FORMAT` is stored/exported but not interpreted.
 - `stride_bytes_i` is only used for read pointer accounting, not actual lane skipping.
 - `READ_PTR` is now connected for streams 0 and 1. Streams 2..7 read as zero until additional readers/scheduler logic exist.
 - Reader underrun/runtime error is reflected into `ERROR_MASK` and per-stream `STATUS[5]`, but it is not latched. It reflects current reader behavior rather than a sticky fault history.
 - The reader currently assumes contiguous 16-bit packed sample lanes in DDR.
 - There is still no multi-stream scheduler for streams 2..7.
+- The full butterfly engine computes one butterfly over two clocks, so it is not
+  a one-sample-per-clock fully parallel implementation. For `VECTOR_LEN=1024`,
+  compute latency is about `log2(1024) * 512 * 2 = 10240` clocks after loading.
+- DAC playback emits two final-vector samples per DAC clock, one on each output
+  channel. It does not yet provide a selectable output formatting/routing mode.
