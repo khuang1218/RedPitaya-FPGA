@@ -528,3 +528,28 @@ After Vivado compile succeeds and software support is added or register writes a
   compute latency is about `log2(1024) * 512 * 2 = 10240` clocks after loading.
 - DAC playback emits two final-vector samples per DAC clock, one on each output
   channel. It does not yet provide a selectable output formatting/routing mode.
+
+## Post-Implementation DRC Note
+
+Vivado implementation reported:
+
+```text
+[DRC UTLZ-1] Resource utilization ...
+requires 107756 LUT-like cells, only 106461 compatible sites available
+```
+
+This means the design was about 1295 LUT-compatible resources over the target
+device. The likely cause is large BNET memories being inferred into distributed
+RAM/LUT fabric instead of block RAM.
+
+First fix applied:
+
+```systemverilog
+(* ram_style = "block" *) bank0_ram
+(* ram_style = "block" *) bank1_ram
+(* ram_style = "block" *) weight_ram
+```
+
+These hints were added in `prj/v0.94/rtl/butterfly_network.sv`. Re-run Vivado
+implementation and check whether LUT/distributed-RAM utilization drops and BRAM
+utilization increases.

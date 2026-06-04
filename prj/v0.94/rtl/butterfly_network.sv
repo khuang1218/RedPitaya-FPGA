@@ -72,9 +72,9 @@ module butterfly_network #(
 
   state_t state;
 
-  logic signed [IN_DW-1:0]              bank0_ram [0:VECTOR_LEN-1];
-  logic signed [IN_DW-1:0]              bank1_ram [0:VECTOR_LEN-1];
-  logic signed [2*WEIGHT_DW-1:0]        weight_ram [0:TOTAL_WEIGHTS-1];
+  (* ram_style = "block" *) logic signed [IN_DW-1:0]       bank0_ram  [0:VECTOR_LEN-1];
+  (* ram_style = "block" *) logic signed [IN_DW-1:0]       bank1_ram  [0:VECTOR_LEN-1];
+  (* ram_style = "block" *) logic signed [2*WEIGHT_DW-1:0] weight_ram [0:TOTAL_WEIGHTS-1];
 
   logic [ADDR_W-1:0]                    sample_wr_addr;
   logic [WEIGHT_ADDR_W-1:0]             weight_wr_addr;
