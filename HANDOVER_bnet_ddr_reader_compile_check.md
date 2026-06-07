@@ -553,3 +553,113 @@ First fix applied:
 These hints were added in `prj/v0.94/rtl/butterfly_network.sv`. Re-run Vivado
 implementation and check whether LUT/distributed-RAM utilization drops and BRAM
 utilization increases.
+
+Second fix applied after the same utilization DRC persisted:
+
+```text
+The butterfly datapath now uses one shared multiplier across four FSM states:
+
+ST_MUL_A_Y0
+ST_MUL_B_Y0
+ST_MUL_A_Y1
+ST_MUL_B_Y1
+```
+
+The previous version computed all four products for a butterfly in parallel:
+
+```text
+a * wa_y0
+b * wb_y0
+a * wa_y1
+b * wb_y1
+```
+
+The new version serializes those products and accumulates them before
+`ST_WRITE`. This should reduce arithmetic fabric/DSP pressure, at the cost of
+increasing compute latency. For `VECTOR_LEN=1024`, compute latency becomes about:
+
+```text
+log2(1024) * 512 butterflies/stage * 6 clocks/butterfly ~= 30720 clocks
+```
+
+That is still short in real time at the Red Pitaya FPGA clock, and it is a much
+better first-fit architecture for the Zynq-7020.
+
+Third fix applied after Vivado reported:
+
+```text
+[DRC UTLZ-1] LUT as Logic over-utilized
+requires 87217 LUT as Logic, only 53200 available
+```
+
+This points to RAM or RAM-port muxing being mapped into ordinary LUT logic. The
+raw `bank0_ram`, `bank1_ram`, and `weight_ram` arrays were replaced with an
+explicit true-dual-port RAM wrapper:
+
+```systemverilog
+bnet_tdp_ram
+```
+
+The staged engine now drives explicit RAM port signals:
+
+```text
+addr_a, din_a, we_a, dout_a
+addr_b, din_b, we_b, dout_b
+```
+
+and uses a new `ST_LATCH` state after `ST_READ` to account for synchronous BRAM
+read latency.
+
+Expected inference:
+
+```text
+bank0 vector RAM -> block RAM
+bank1 vector RAM -> block RAM
+weight RAM       -> block RAM
+```
+
+Updated compute latency is about:
+
+```text
+log2(1024) * 512 butterflies/stage * 7 clocks/butterfly ~= 35840 clocks
+```
+
+Still comfortably small in wall-clock time at the FPGA clock.
+
+## Vivado 2020.1 RAM Inference Fix
+
+Vivado synthesis then failed before implementation with:
+
+```text
+Unable to infer a block/distributed RAM for 'ram_reg'
+RAM has multiple writes via different ports in same process.
+If RAM inferencing intended, write to one port per process.
+```
+
+This was not a butterfly-network math problem. The `bnet_tdp_ram` wrapper used
+one `always_ff` block for both true-dual-port write ports, and Vivado 2020.1 did
+not recognize that as a supported BRAM template. Because the weight RAM is
+`10240 x 14` bits, Vivado could not safely dissolve it into registers/LUTs.
+
+Fix applied:
+
+```systemverilog
+always_ff @(posedge clk_i) begin
+  if (we_a_i) begin
+    ram[addr_a_i] <= din_a_i;
+  end
+  dout_a_o <= ram[addr_a_i];
+end
+
+always_ff @(posedge clk_i) begin
+  if (we_b_i) begin
+    ram[addr_b_i] <= din_b_i;
+  end
+  dout_b_o <= ram[addr_b_i];
+end
+```
+
+Each RAM port now has its own clocked process, matching the template Vivado
+asked for in the synthesis report. Re-run synthesis first and check that
+`bank0`, `bank1`, and `weight_ram` infer as block RAM instead of being
+dissolved into LUT/register fabric.

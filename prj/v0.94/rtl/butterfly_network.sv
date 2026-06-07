@@ -62,19 +62,47 @@ module butterfly_network #(
   localparam logic [STAGE_W-1:0] LAST_STAGE = STAGE_COUNT - 1;
   localparam logic [PAIR_W-1:0] LAST_PAIR = PAIR_COUNT - 1;
 
-  typedef enum logic [2:0] {
+  typedef enum logic [3:0] {
     ST_IDLE,
     ST_LOAD,
     ST_READ,
+    ST_LATCH,
+    ST_MUL_A_Y0,
+    ST_MUL_B_Y0,
+    ST_MUL_A_Y1,
+    ST_MUL_B_Y1,
     ST_WRITE,
     ST_PLAYBACK
   } state_t;
 
   state_t state;
 
-  (* ram_style = "block" *) logic signed [IN_DW-1:0]       bank0_ram  [0:VECTOR_LEN-1];
-  (* ram_style = "block" *) logic signed [IN_DW-1:0]       bank1_ram  [0:VECTOR_LEN-1];
-  (* ram_style = "block" *) logic signed [2*WEIGHT_DW-1:0] weight_ram [0:TOTAL_WEIGHTS-1];
+  logic [ADDR_W-1:0]                    bank0_addr_a;
+  logic [ADDR_W-1:0]                    bank0_addr_b;
+  logic signed [IN_DW-1:0]              bank0_din_a;
+  logic signed [IN_DW-1:0]              bank0_din_b;
+  logic                                 bank0_we_a;
+  logic                                 bank0_we_b;
+  logic signed [IN_DW-1:0]              bank0_dout_a;
+  logic signed [IN_DW-1:0]              bank0_dout_b;
+
+  logic [ADDR_W-1:0]                    bank1_addr_a;
+  logic [ADDR_W-1:0]                    bank1_addr_b;
+  logic signed [IN_DW-1:0]              bank1_din_a;
+  logic signed [IN_DW-1:0]              bank1_din_b;
+  logic                                 bank1_we_a;
+  logic                                 bank1_we_b;
+  logic signed [IN_DW-1:0]              bank1_dout_a;
+  logic signed [IN_DW-1:0]              bank1_dout_b;
+
+  logic [WEIGHT_ADDR_W-1:0]             weight_addr_port_a;
+  logic [WEIGHT_ADDR_W-1:0]             weight_addr_port_b;
+  logic signed [2*WEIGHT_DW-1:0]        weight_din_a;
+  logic signed [2*WEIGHT_DW-1:0]        weight_din_b;
+  logic                                 weight_we_a;
+  logic                                 weight_we_b;
+  logic signed [2*WEIGHT_DW-1:0]        weight_dout_a;
+  logic signed [2*WEIGHT_DW-1:0]        weight_dout_b;
 
   logic [ADDR_W-1:0]                    sample_wr_addr;
   logic [WEIGHT_ADDR_W-1:0]             weight_wr_addr;
@@ -99,10 +127,9 @@ module butterfly_network #(
   logic signed [WEIGHT_DW-1:0]          weight_a_y1;
   logic signed [WEIGHT_DW-1:0]          weight_b_y0;
   logic signed [WEIGHT_DW-1:0]          weight_b_y1;
-  logic signed [PROD_DW-1:0]            prod_a_y0;
-  logic signed [PROD_DW-1:0]            prod_a_y1;
-  logic signed [PROD_DW-1:0]            prod_b_y0;
-  logic signed [PROD_DW-1:0]            prod_b_y1;
+  logic signed [IN_DW-1:0]              mul_sample;
+  logic signed [WEIGHT_DW-1:0]          mul_weight;
+  logic signed [PROD_DW-1:0]            mul_product;
   logic signed [ACC_DW-1:0]             acc_y0;
   logic signed [ACC_DW-1:0]             acc_y1;
   logic signed [ACC_DW-1:0]             scaled_y0;
@@ -179,26 +206,168 @@ module butterfly_network #(
     weight_b_y0 = weight_b[(2*WEIGHT_DW)-1 -: WEIGHT_DW];
     weight_b_y1 = weight_b[WEIGHT_DW-1:0];
 
-    prod_a_y0 = mul_sample_weight(sample_a, weight_a_y0);
-    prod_a_y1 = mul_sample_weight(sample_a, weight_a_y1);
-    prod_b_y0 = mul_sample_weight(sample_b, weight_b_y0);
-    prod_b_y1 = mul_sample_weight(sample_b, weight_b_y1);
+    mul_sample = '0;
+    mul_weight = '0;
+    unique case (state)
+      ST_MUL_A_Y0: begin
+        mul_sample = sample_a;
+        mul_weight = weight_a_y0;
+      end
+      ST_MUL_B_Y0: begin
+        mul_sample = sample_b;
+        mul_weight = weight_b_y0;
+      end
+      ST_MUL_A_Y1: begin
+        mul_sample = sample_a;
+        mul_weight = weight_a_y1;
+      end
+      ST_MUL_B_Y1: begin
+        mul_sample = sample_b;
+        mul_weight = weight_b_y1;
+      end
+      default: begin
+        mul_sample = '0;
+        mul_weight = '0;
+      end
+    endcase
 
-    acc_y0 = {prod_a_y0[PROD_DW-1], prod_a_y0}
-           + {prod_b_y0[PROD_DW-1], prod_b_y0};
-    acc_y1 = {prod_a_y1[PROD_DW-1], prod_a_y1}
-           + {prod_b_y1[PROD_DW-1], prod_b_y1};
+    mul_product = mul_sample_weight(mul_sample, mul_weight);
 
     scaled_y0 = round_shift(acc_y0);
     scaled_y1 = round_shift(acc_y1);
     result_y0 = sat_to_out(scaled_y0);
     result_y1 = sat_to_out(scaled_y1);
+
+    bank0_addr_a = '0;
+    bank0_addr_b = '0;
+    bank0_din_a = '0;
+    bank0_din_b = '0;
+    bank0_we_a = 1'b0;
+    bank0_we_b = 1'b0;
+
+    bank1_addr_a = '0;
+    bank1_addr_b = '0;
+    bank1_din_a = '0;
+    bank1_din_b = '0;
+    bank1_we_a = 1'b0;
+    bank1_we_b = 1'b0;
+
+    weight_addr_port_a = '0;
+    weight_addr_port_b = '0;
+    weight_din_a = '0;
+    weight_din_b = '0;
+    weight_we_a = 1'b0;
+    weight_we_b = 1'b0;
+
+    unique case (state)
+      ST_LOAD: begin
+        bank0_addr_a = sample_wr_addr;
+        bank0_din_a = sample_i;
+        bank0_we_a = !samples_loaded && sample_valid_i;
+
+        weight_addr_port_a = weight_wr_addr;
+        weight_din_a = weight_i;
+        weight_we_a = !weights_loaded && weight_valid_i;
+      end
+
+      ST_READ: begin
+        if (!read_bank) begin
+          bank0_addr_a = addr_a;
+          bank0_addr_b = addr_b;
+        end else begin
+          bank1_addr_a = addr_a;
+          bank1_addr_b = addr_b;
+        end
+
+        weight_addr_port_a = weight_addr_a;
+        weight_addr_port_b = weight_addr_b;
+      end
+
+      ST_WRITE: begin
+        if (!read_bank) begin
+          bank1_addr_a = addr_a;
+          bank1_addr_b = addr_b;
+          bank1_din_a = result_y0;
+          bank1_din_b = result_y1;
+          bank1_we_a = 1'b1;
+          bank1_we_b = 1'b1;
+        end else begin
+          bank0_addr_a = addr_a;
+          bank0_addr_b = addr_b;
+          bank0_din_a = result_y0;
+          bank0_din_b = result_y1;
+          bank0_we_a = 1'b1;
+          bank0_we_b = 1'b1;
+        end
+      end
+
+      ST_PLAYBACK: begin
+        if (!read_bank) begin
+          bank0_addr_a = playback_addr;
+          bank0_addr_b = playback_addr + 1'b1;
+        end else begin
+          bank1_addr_a = playback_addr;
+          bank1_addr_b = playback_addr + 1'b1;
+        end
+      end
+
+      default: begin
+      end
+    endcase
   end
 
   assign sample_ready_o = (state == ST_LOAD) && !samples_loaded;
   assign weight_ready_o = (state == ST_LOAD) && !weights_loaded;
   assign busy_o = (state != ST_IDLE) && (state != ST_PLAYBACK);
   assign output_valid_o = (state == ST_PLAYBACK);
+
+  bnet_tdp_ram #(
+    .DW    (IN_DW),
+    .DEPTH (VECTOR_LEN),
+    .AW    (ADDR_W)
+  ) i_bank0_ram (
+    .clk_i    (clk_i),
+    .addr_a_i (bank0_addr_a),
+    .din_a_i  (bank0_din_a),
+    .we_a_i   (bank0_we_a),
+    .dout_a_o (bank0_dout_a),
+    .addr_b_i (bank0_addr_b),
+    .din_b_i  (bank0_din_b),
+    .we_b_i   (bank0_we_b),
+    .dout_b_o (bank0_dout_b)
+  );
+
+  bnet_tdp_ram #(
+    .DW    (IN_DW),
+    .DEPTH (VECTOR_LEN),
+    .AW    (ADDR_W)
+  ) i_bank1_ram (
+    .clk_i    (clk_i),
+    .addr_a_i (bank1_addr_a),
+    .din_a_i  (bank1_din_a),
+    .we_a_i   (bank1_we_a),
+    .dout_a_o (bank1_dout_a),
+    .addr_b_i (bank1_addr_b),
+    .din_b_i  (bank1_din_b),
+    .we_b_i   (bank1_we_b),
+    .dout_b_o (bank1_dout_b)
+  );
+
+  bnet_tdp_ram #(
+    .DW    (2*WEIGHT_DW),
+    .DEPTH (TOTAL_WEIGHTS),
+    .AW    (WEIGHT_ADDR_W)
+  ) i_weight_ram (
+    .clk_i    (clk_i),
+    .addr_a_i (weight_addr_port_a),
+    .din_a_i  (weight_din_a),
+    .we_a_i   (weight_we_a),
+    .dout_a_o (weight_dout_a),
+    .addr_b_i (weight_addr_port_b),
+    .din_b_i  (weight_din_b),
+    .we_b_i   (weight_we_b),
+    .dout_b_o (weight_dout_b)
+  );
 
   always_ff @(posedge clk_i) begin
     if (!rstn_i) begin
@@ -215,6 +384,8 @@ module butterfly_network #(
       sample_b <= '0;
       weight_a <= '0;
       weight_b <= '0;
+      acc_y0 <= '0;
+      acc_y1 <= '0;
       y0_o <= '0;
       y1_o <= '0;
       done_o <= 1'b0;
@@ -238,7 +409,6 @@ module butterfly_network #(
 
         ST_LOAD: begin
           if (!samples_loaded && sample_valid_i) begin
-            bank0_ram[sample_wr_addr] <= sample_i;
             if (sample_wr_addr == LAST_SAMPLE_ADDR) begin
               samples_loaded <= 1'b1;
             end else begin
@@ -247,7 +417,6 @@ module butterfly_network #(
           end
 
           if (!weights_loaded && weight_valid_i) begin
-            weight_ram[weight_wr_addr] <= weight_i;
             if (weight_wr_addr == LAST_WEIGHT_ADDR) begin
               weights_loaded <= 1'b1;
             end else begin
@@ -265,27 +434,45 @@ module butterfly_network #(
         end
 
         ST_READ: begin
+          state <= ST_LATCH;
+        end
+
+        ST_LATCH: begin
           if (!read_bank) begin
-            sample_a <= bank0_ram[addr_a];
-            sample_b <= bank0_ram[addr_b];
+            sample_a <= bank0_dout_a;
+            sample_b <= bank0_dout_b;
           end else begin
-            sample_a <= bank1_ram[addr_a];
-            sample_b <= bank1_ram[addr_b];
+            sample_a <= bank1_dout_a;
+            sample_b <= bank1_dout_b;
           end
-          weight_a <= weight_ram[weight_addr_a];
-          weight_b <= weight_ram[weight_addr_b];
+          weight_a <= weight_dout_a;
+          weight_b <= weight_dout_b;
+          acc_y0 <= '0;
+          acc_y1 <= '0;
+          state <= ST_MUL_A_Y0;
+        end
+
+        ST_MUL_A_Y0: begin
+          acc_y0 <= {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
+          state <= ST_MUL_B_Y0;
+        end
+
+        ST_MUL_B_Y0: begin
+          acc_y0 <= acc_y0 + {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
+          state <= ST_MUL_A_Y1;
+        end
+
+        ST_MUL_A_Y1: begin
+          acc_y1 <= {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
+          state <= ST_MUL_B_Y1;
+        end
+
+        ST_MUL_B_Y1: begin
+          acc_y1 <= acc_y1 + {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
           state <= ST_WRITE;
         end
 
         ST_WRITE: begin
-          if (!read_bank) begin
-            bank1_ram[addr_a] <= result_y0;
-            bank1_ram[addr_b] <= result_y1;
-          end else begin
-            bank0_ram[addr_a] <= result_y0;
-            bank0_ram[addr_b] <= result_y1;
-          end
-
           if (pair_idx == LAST_PAIR) begin
             pair_idx <= '0;
             if (stage_idx == LAST_STAGE) begin
@@ -317,11 +504,11 @@ module butterfly_network #(
             state <= ST_LOAD;
           end else begin
             if (!read_bank) begin
-              y0_o <= bank0_ram[playback_addr];
-              y1_o <= bank0_ram[playback_addr + 1'b1];
+              y0_o <= bank0_dout_a;
+              y1_o <= bank0_dout_b;
             end else begin
-              y0_o <= bank1_ram[playback_addr];
-              y1_o <= bank1_ram[playback_addr + 1'b1];
+              y0_o <= bank1_dout_a;
+              y1_o <= bank1_dout_b;
             end
 
             if (playback_addr >= LAST_SAMPLE_ADDR - 1'b1) begin
@@ -340,3 +527,39 @@ module butterfly_network #(
   end
 
 endmodule: butterfly_network
+
+module bnet_tdp_ram #(
+  parameter int unsigned DW = 14,
+  parameter int unsigned DEPTH = 1024,
+  parameter int unsigned AW = 10
+)(
+  input  logic                     clk_i,
+
+  input  logic [AW-1:0]            addr_a_i,
+  input  logic signed [DW-1:0]     din_a_i,
+  input  logic                     we_a_i,
+  output logic signed [DW-1:0]     dout_a_o,
+
+  input  logic [AW-1:0]            addr_b_i,
+  input  logic signed [DW-1:0]     din_b_i,
+  input  logic                     we_b_i,
+  output logic signed [DW-1:0]     dout_b_o
+);
+
+  (* ram_style = "block" *) logic signed [DW-1:0] ram [0:DEPTH-1];
+
+  always_ff @(posedge clk_i) begin
+    if (we_a_i) begin
+      ram[addr_a_i] <= din_a_i;
+    end
+    dout_a_o <= ram[addr_a_i];
+  end
+
+  always_ff @(posedge clk_i) begin
+    if (we_b_i) begin
+      ram[addr_b_i] <= din_b_i;
+    end
+    dout_b_o <= ram[addr_b_i];
+  end
+
+endmodule: bnet_tdp_ram
