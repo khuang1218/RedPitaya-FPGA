@@ -11,6 +11,20 @@ For the most current compile-check handover, use:
 HANDOVER_bnet_ddr_reader_compile_check.md
 ```
 
+Board-debug update from 2026-06-08:
+
+- The current failure is no longer the original ASG-fed butterfly milestone.
+- `BNET:RST` initially did not reset the DDR readers or staged butterfly FSM;
+  that reset propagation bug has been fixed in the newer HDL.
+- A later DDR smoke test showed partial stream consumption
+  (`stream0_rptr=1152` vs expected `2048`, `stream1_rptr=7552` vs expected
+  `20480`) and `STATUS=0x1` busy forever.
+- The likely reader-side cause was overlapping AXI read burst requests caused
+  by the delayed `axi_rd_burst.ctrl_busy_o` handshake. The newer DDR-reader
+  handover records the fix in `bnet_axi_reader_ch.sv`.
+- Use `HANDOVER_bnet_ddr_reader_compile_check.md` for all DDR-mode debug,
+  validation expectations, and remaining risks.
+
 That newer handover covers:
 
 - BNET input source selection through `CONFIG[1:0]`.

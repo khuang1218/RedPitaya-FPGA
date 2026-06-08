@@ -251,6 +251,9 @@ SBG_T                    bnet_sample_dat;
 logic signed [14-1:0]    bnet_weight_dat;
 logic [2-1:0]            bnet_input_sel;
 logic                    bnet_start_pulse;
+logic                    bnet_soft_reset_pulse;
+logic [4-1:0]            bnet_start_stretch;
+logic                    bnet_start_run;
 logic                    bnet_start;
 logic                    bnet_sample_valid;
 logic                    bnet_weight_valid;
@@ -342,6 +345,19 @@ assign bnet_stream_runtime_error = {
   bnet_ddr_weight_underrun,
   bnet_ddr_sample_underrun
 };
+
+always_ff @(posedge adc_clk) begin
+  if (!adc_rstn || bnet_soft_reset_pulse) begin
+    bnet_start_stretch <= 4'd0;
+  end else if (bnet_start_pulse && (bnet_input_sel == 2'd2)) begin
+    bnet_start_stretch <= 4'hf;
+  end else begin
+    bnet_start_stretch <= {1'b0, bnet_start_stretch[3:1]};
+  end
+end
+
+assign bnet_start_run = (bnet_input_sel == 2'd2) ? |bnet_start_stretch :
+                                                     bnet_start_pulse;
 
 generate
 for (genvar BNET_RPTR_IDX = 2; BNET_RPTR_IDX < BNET_STREAM_COUNT; BNET_RPTR_IDX++) begin : bnet_unused_rptr
@@ -645,7 +661,8 @@ bnet_axi_reader_ch #(
 ) i_bnet_sample_reader (
   .cfg_clk_i      (adc_clk),
   .cfg_rstn_i     (adc_rstn),
-  .start_i        (bnet_start_pulse && (bnet_input_sel == 2'd2)),
+  .soft_reset_i   (bnet_soft_reset_pulse),
+  .start_i        (bnet_start_run && (bnet_input_sel == 2'd2)),
   .enable_i       (bnet_stream_enable[0]),
   .active_buf_i   (bnet_stream_active_buf[0]),
   .base0_i        (bnet_stream_base0[0]),
@@ -666,7 +683,8 @@ bnet_axi_reader_ch #(
 ) i_bnet_weight_reader (
   .cfg_clk_i      (adc_clk),
   .cfg_rstn_i     (adc_rstn),
-  .start_i        (bnet_start_pulse && (bnet_input_sel == 2'd2)),
+  .soft_reset_i   (bnet_soft_reset_pulse),
+  .start_i        (bnet_start_run && (bnet_input_sel == 2'd2)),
   .enable_i       (bnet_stream_enable[1]),
   .active_buf_i   (bnet_stream_active_buf[1]),
   .base0_i        (bnet_stream_base0[1]),
@@ -702,7 +720,7 @@ always_comb begin
     2'd2: begin
       bnet_sample_dat = bnet_ddr_sample_dat;
       bnet_weight_dat = bnet_ddr_weight_dat;
-      bnet_start = bnet_start_pulse;
+      bnet_start = bnet_start_run;
       bnet_sample_valid = bnet_ddr_sample_valid;
       bnet_weight_valid = bnet_ddr_weight_valid;
     end
@@ -726,6 +744,7 @@ butterfly_network #(
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
+  .soft_reset_i (bnet_soft_reset_pulse),
   .start_i  (bnet_start),
   .sample_valid_i (bnet_sample_valid),
   .sample_ready_o (bnet_sample_ready),
@@ -1213,6 +1232,7 @@ red_pitaya_daisy  #(
     .led6_heartbeat_en_o (bnet_led6_heartbeat_en),
     .input_sel_o    (bnet_input_sel),
     .start_pulse_o  (bnet_start_pulse),
+    .soft_reset_pulse_o (bnet_soft_reset_pulse),
     .compute_busy_i (bnet_busy),
     .compute_done_i (bnet_done),
     .compute_output_valid_i (bnet_output_valid),

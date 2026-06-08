@@ -65,6 +65,7 @@ module bnet_regs #(
   output logic          led6_heartbeat_en_o,
   output logic [ 2-1:0] input_sel_o,
   output logic          start_pulse_o,
+  output logic          soft_reset_pulse_o,
   input  logic          compute_busy_i,
   input  logic          compute_done_i,
   input  logic          compute_output_valid_i,
@@ -173,6 +174,7 @@ module bnet_regs #(
       status_reg  <= 32'd0;
       config_reg  <= 32'd0;
       start_pulse_o <= 1'b0;
+      soft_reset_pulse_o <= 1'b0;
       vector_len_reg <= 32'd1024;
       for (int i = 0; i < 8; i++) begin
         ch_data[i] <= 32'd0;
@@ -192,6 +194,7 @@ module bnet_regs #(
       end
     end else begin
       start_pulse_o <= 1'b0;
+      soft_reset_pulse_o <= 1'b0;
       status_reg[0] <= compute_busy_i;
       if (compute_done_i) begin
         status_reg[1] <= 1'b1;
@@ -207,6 +210,7 @@ module bnet_regs #(
               control_reg <= 32'd0;
               status_reg  <= 32'd0;
               config_reg  <= 32'd0;
+              soft_reset_pulse_o <= 1'b1;
               vector_len_reg <= 32'd1024;
               for (int i = 0; i < 8; i++) begin
                 ch_data[i] <= 32'd0;

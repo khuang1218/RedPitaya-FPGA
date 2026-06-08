@@ -14,6 +14,7 @@ module bnet_axi_reader_ch #(
 )(
   input  logic                         cfg_clk_i,
   input  logic                         cfg_rstn_i,
+  input  logic                         soft_reset_i,
   input  logic                         start_i,
 
   input  logic                         enable_i,
@@ -44,6 +45,13 @@ module bnet_axi_reader_ch #(
   logic start_toggle_axi;
   logic start_toggle_axi_d;
   logic start_axi_pulse;
+  logic start_cfg_pulse;
+  logic soft_reset_cfg_d;
+  logic soft_reset_toggle_cfg;
+  logic soft_reset_toggle_axi_meta;
+  logic soft_reset_toggle_axi;
+  logic soft_reset_toggle_axi_d;
+  logic soft_reset_axi_pulse;
 
   logic [32-1:0] length_bytes_axi;
   logic [32-1:0] rd_addr_axi;
@@ -60,6 +68,8 @@ module bnet_axi_reader_ch #(
   logic [3-1:0]  ctrl_rsize;
   logic          ctrl_val;
   logic          ctrl_busy;
+  logic          ctrl_req_inflight_axi;
+  logic          ctrl_busy_seen_axi;
 
   logic [AXI_DW-1:0] rd_data;
   logic [32-1:0]     rd_addr;
@@ -73,27 +83,36 @@ module bnet_axi_reader_ch #(
   logic          fifo_rd;
   logic          fifo_rst_cfg;
   logic          fifo_rst_axi;
+  logic          fifo_wr_rst_busy;
+  logic          fifo_rd_rst_busy;
 
   logic          fifo_rd_pending;
   logic [AXI_DW-1:0] word_data;
   logic          word_valid;
   logic [LANE_W-1:0] lane_index;
 
+  assign start_cfg_pulse = start_i && !start_cfg_d;
   assign ready_o = !fifo_empty || word_valid;
   assign underrun_o = consume_i && !word_valid;
   assign ctrl_rsize = 3'h3;
-  assign fifo_wr = rd_dval;
+  assign fifo_wr = rd_dval && !fifo_wr_rst_busy && !fifo_full;
   assign fifo_din = {rd_addr, rd_data};
-  assign fifo_rst_cfg = !cfg_rstn_i || start_i;
+  assign fifo_rst_cfg = !cfg_rstn_i || soft_reset_i || start_cfg_pulse;
 
   always_ff @(posedge cfg_clk_i) begin
     if (!cfg_rstn_i) begin
       start_cfg_d <= 1'b0;
       start_toggle_cfg <= 1'b0;
+      soft_reset_cfg_d <= 1'b0;
+      soft_reset_toggle_cfg <= 1'b0;
     end else begin
       start_cfg_d <= start_i;
-      if (start_i && !start_cfg_d) begin
+      if (start_cfg_pulse) begin
         start_toggle_cfg <= ~start_toggle_cfg;
+      end
+      soft_reset_cfg_d <= soft_reset_i;
+      if (soft_reset_i && !soft_reset_cfg_d) begin
+        soft_reset_toggle_cfg <= ~soft_reset_toggle_cfg;
       end
     end
   end
@@ -103,15 +122,22 @@ module bnet_axi_reader_ch #(
       start_toggle_axi_meta <= 1'b0;
       start_toggle_axi <= 1'b0;
       start_toggle_axi_d <= 1'b0;
+      soft_reset_toggle_axi_meta <= 1'b0;
+      soft_reset_toggle_axi <= 1'b0;
+      soft_reset_toggle_axi_d <= 1'b0;
     end else begin
       start_toggle_axi_meta <= start_toggle_cfg;
       start_toggle_axi <= start_toggle_axi_meta;
       start_toggle_axi_d <= start_toggle_axi;
+      soft_reset_toggle_axi_meta <= soft_reset_toggle_cfg;
+      soft_reset_toggle_axi <= soft_reset_toggle_axi_meta;
+      soft_reset_toggle_axi_d <= soft_reset_toggle_axi;
     end
   end
 
   assign start_axi_pulse = start_toggle_axi ^ start_toggle_axi_d;
-  assign fifo_rst_axi = !axi_sys.rstn || start_axi_pulse;
+  assign soft_reset_axi_pulse = soft_reset_toggle_axi ^ soft_reset_toggle_axi_d;
+  assign fifo_rst_axi = !axi_sys.rstn || soft_reset_axi_pulse || start_axi_pulse;
 
   always_comb begin
     remaining_bytes_axi = (bytes_requested_axi < length_bytes_axi) ?
@@ -130,13 +156,15 @@ module bnet_axi_reader_ch #(
     can_request_axi = running_axi &&
                       (remaining_bytes_axi != 32'd0) &&
                       (next_burst_beats_axi != 5'd0) &&
+                      !ctrl_req_inflight_axi &&
                       !ctrl_busy &&
                       !fifo_full &&
+                      !fifo_wr_rst_busy &&
                       !ctrl_val;
   end
 
   always_ff @(posedge axi_sys.clk) begin
-    if (!axi_sys.rstn) begin
+    if (!axi_sys.rstn || soft_reset_axi_pulse) begin
       length_bytes_axi <= 32'd0;
       rd_addr_axi <= 32'd0;
       bytes_requested_axi <= 32'd0;
@@ -144,6 +172,8 @@ module bnet_axi_reader_ch #(
       ctrl_addr <= 32'd0;
       ctrl_size <= 4'd0;
       ctrl_val <= 1'b0;
+      ctrl_req_inflight_axi <= 1'b0;
+      ctrl_busy_seen_axi <= 1'b0;
     end else begin
       ctrl_val <= 1'b0;
 
@@ -152,22 +182,33 @@ module bnet_axi_reader_ch #(
         rd_addr_axi <= active_buf_i ? base1_i : base0_i;
         bytes_requested_axi <= 32'd0;
         running_axi <= enable_i && (length_bytes_i != 32'd0);
+        ctrl_req_inflight_axi <= 1'b0;
+        ctrl_busy_seen_axi <= 1'b0;
       end else if (can_request_axi) begin
         ctrl_addr <= rd_addr_axi;
         ctrl_size <= next_burst_beats_axi[3:0] - 1'b1;
         ctrl_val <= 1'b1;
         rd_addr_axi <= rd_addr_axi + next_burst_bytes_axi;
         bytes_requested_axi <= bytes_requested_axi + next_burst_bytes_axi;
+        ctrl_req_inflight_axi <= 1'b1;
+        ctrl_busy_seen_axi <= 1'b0;
 
         if (next_burst_bytes_axi >= remaining_bytes_axi) begin
           running_axi <= 1'b0;
+        end
+      end else if (ctrl_req_inflight_axi) begin
+        if (ctrl_busy) begin
+          ctrl_busy_seen_axi <= 1'b1;
+        end else if (ctrl_busy_seen_axi) begin
+          ctrl_req_inflight_axi <= 1'b0;
+          ctrl_busy_seen_axi <= 1'b0;
         end
       end
     end
   end
 
   always_ff @(posedge cfg_clk_i) begin
-    if (!cfg_rstn_i) begin
+    if (!cfg_rstn_i || soft_reset_i) begin
       fifo_rd <= 1'b0;
       fifo_rd_pending <= 1'b0;
       word_data <= '0;
@@ -179,14 +220,14 @@ module bnet_axi_reader_ch #(
     end else begin
       fifo_rd <= 1'b0;
 
-      if (start_i) begin
+      if (start_cfg_pulse) begin
         fifo_rd_pending <= 1'b0;
         word_valid <= 1'b0;
         lane_index <= '0;
         read_ptr_o <= 32'd0;
         valid_o <= 1'b0;
       end else begin
-        if (!word_valid && !fifo_empty && !fifo_rd_pending) begin
+        if (!word_valid && !fifo_empty && !fifo_rd_pending && !fifo_rd_rst_busy) begin
           fifo_rd <= 1'b1;
           fifo_rd_pending <= 1'b1;
         end
@@ -233,8 +274,8 @@ module bnet_axi_reader_ch #(
     .rd_en         (fifo_rd),
     .rd_data_count (),
     .empty         (fifo_empty),
-    .wr_rst_busy   (),
-    .rd_rst_busy   ()
+    .wr_rst_busy   (fifo_wr_rst_busy),
+    .rd_rst_busy   (fifo_rd_rst_busy)
   );
 
   axi_rd_burst #(
@@ -252,7 +293,7 @@ module bnet_axi_reader_ch #(
     .rd_data_o    (rd_data),
     .rd_addr_o    (rd_addr),
     .rd_dval_o    (rd_dval),
-    .rd_drdy_i    (!fifo_full),
+    .rd_drdy_i    (!fifo_full && !fifo_wr_rst_busy),
     .diags_o      (),
     .ctrl_busy_o  (ctrl_busy),
     .stat_busy_o  ()

@@ -456,6 +456,163 @@ Passed, with only Git CRLF warnings.
 
 Checked there is only one `bnet_regs` instantiation and one `butterfly_network` instantiation.
 
+## Board Debug Findings - 2026-06-08
+
+The first hardware runs exposed two separate DDR-mode bugs.
+
+### Bug 1: BNET reset did not reset DDR readers
+
+Symptom from the notebook diagnostics:
+
+```text
+BNET:RST
+BNET:STREAM0:RPTR? -> nonzero, for example 1152
+BNET:STREAM1:RPTR? -> nonzero, for example 7528
+```
+
+Meaning:
+
+- The SCPI/API path was reaching `bnet_regs`.
+- The reader read-pointer registers were not being reset by `BNET:RST`.
+- This made later smoke-test results ambiguous because stale reader state
+  survived across runs.
+
+Root cause:
+
+- `bnet_regs.sv` handled the soft reset internally, but the reset pulse was not
+  exported to the DDR readers or `butterfly_network`.
+
+Fix applied:
+
+- `bnet_regs.sv`
+  - Added `soft_reset_pulse_o`.
+  - Pulses it when `CONTROL[1]` is written.
+- `red_pitaya_top_LED7_mod.sv`
+  - Added `bnet_soft_reset_pulse`.
+  - Wired it into both `bnet_axi_reader_ch` instances.
+  - Wired it into `butterfly_network`.
+- `bnet_axi_reader_ch.sv`
+  - Added `soft_reset_i`.
+  - Resets cfg-clock visible state, including `read_ptr_o`.
+  - Synchronizes soft reset into the AXI clock domain and resets the AXI-side
+    reader FSM/FIFO.
+- `butterfly_network.sv`
+  - FSM reset condition now includes `soft_reset_i`.
+
+Board confirmation after this fix:
+
+```text
+BNET:RST
+BNET:STREAM0:RPTR? -> 0
+BNET:STREAM1:RPTR? -> 0
+```
+
+### Bug 2: DDR reader stopped after partial buffer consumption
+
+After Bug 1 was fixed and the new bitstream was programmed, the smoke test still
+timed out. The new diagnostics were different:
+
+```text
+Before START:
+  pending         = 0x3
+  stream0_rptr    = 0
+  stream1_rptr    = 0
+
+At timeout:
+  status          = 0x1
+  pending         = 0x0
+  error           = 0x0
+  stream0_status  = 0x4
+  stream1_status  = 0x4
+  stream0_rptr    = 1152
+  stream1_rptr    = 7552
+```
+
+Expected consumption for the full staged smoke test:
+
+```text
+stream 0 = 2048 bytes
+stream 1 = 20480 bytes
+```
+
+Interpretation:
+
+- `BNET:START` was accepted.
+- Pending buffers were consumed.
+- Both DDR readers began moving data.
+- The readers then stopped early, so the staged butterfly engine stayed busy
+  waiting for the rest of the load.
+- Increasing the notebook timeout cannot fix this because hardware progress has
+  stopped.
+
+Likely root cause:
+
+- `bnet_axi_reader_ch.sv` used `axi_rd_burst.ctrl_busy_o` to decide when it
+  could issue another `ctrl_val`.
+- In `rtl/classic/axi_rd_burst.sv`, `ctrl_busy_o` is registered from internal
+  `axi_busy`, so it is delayed.
+- The BNET reader could therefore issue another read request before the
+  previous burst's busy state was visible.
+- That allowed `bytes_requested_axi` to run ahead of actual delivered AXI data,
+  so the reader could believe the full descriptor had been requested even
+  though the BNET clock-domain consumer only received a partial stream.
+
+Fix applied in `bnet_axi_reader_ch.sv`:
+
+- Added `ctrl_req_inflight_axi`.
+- Added `ctrl_busy_seen_axi`.
+- The reader now:
+  1. issues one burst,
+  2. waits until `ctrl_busy` is observed high,
+  3. waits until `ctrl_busy` returns low,
+  4. only then allows the next burst request.
+- Also connected FIFO `wr_rst_busy` and `rd_rst_busy`.
+- Gated FIFO write/read and AXI `rd_drdy_i` while FIFO reset is still busy.
+
+This fix has only been source-checked. It has not yet been synthesized or
+tested on hardware.
+
+### Diagnostics still missing
+
+The current public BNET registers show stream read pointers, but they do not
+show enough internal reader state to distinguish AXI starvation, FIFO problems,
+or compute-side backpressure.
+
+Useful future debug counters/status:
+
+- `bytes_requested_axi`
+- delivered AXI beat count
+- consumed sample/word count
+- `running_axi`
+- `ctrl_req_inflight_axi`
+- `ctrl_busy`
+- FIFO empty/full/reset-busy flags
+- butterfly load state, `sample_wr_addr`, `weight_wr_addr`,
+  `samples_loaded`, and `weights_loaded`
+
+Current underrun reporting is also weak because top-level `consume_i` is gated
+by reader `valid_o`. If the butterfly engine is ready but the reader has no
+valid data, `consume_i` is already false, so `underrun_o` may not assert. For a
+real runtime starvation flag, either pass the compute ready signal separately
+into the reader or create a top-level starvation condition:
+
+```text
+DDR mode && compute_ready && !reader_valid
+```
+
+### Remaining risks after the burst-handshake fix
+
+- If `stream0_rptr >= 2048` and `stream1_rptr >= 20480` but `STATUS[1]` still
+  does not assert, the next likely bug is inside `butterfly_network.sv`.
+- If either pointer still stops early, inspect AXI/FIFO behavior in
+  `bnet_axi_reader_ch.sv`.
+- Confirm the Vivado hierarchy has only BNET driving `axi2_sys` and `axi3_sys`;
+  ASG deep-memory AXI should remain connected to dummy interfaces in this
+  BNET bitstream.
+- Confirm the `asg_dat_fifo` IP remains 96-bit wide. The checked XCI reports
+  `Input_Data_Width=96`, `Output_Data_Width=96`, and `Input_Depth=256`, which
+  matches the reader's `{32-bit address, 64-bit data}` FIFO word.
+
 ## Current Git Status
 
 Relevant files at handover:

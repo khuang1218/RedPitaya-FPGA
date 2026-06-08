@@ -30,6 +30,7 @@ module butterfly_network #(
 )(
   input  logic                          clk_i,
   input  logic                          rstn_i,
+  input  logic                          soft_reset_i,
   input  logic                          start_i,
 
   input  logic                          sample_valid_i,
@@ -370,7 +371,7 @@ module butterfly_network #(
   );
 
   always_ff @(posedge clk_i) begin
-    if (!rstn_i) begin
+    if (!rstn_i || soft_reset_i) begin
       state <= ST_IDLE;
       sample_wr_addr <= '0;
       weight_wr_addr <= '0;
