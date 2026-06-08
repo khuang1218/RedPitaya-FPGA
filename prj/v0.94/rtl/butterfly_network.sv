@@ -45,7 +45,11 @@ module butterfly_network #(
   output logic signed [OUT_DW-1:0]      y1_o,
   output logic                          output_valid_o,
   output logic                          busy_o,
-  output logic                          done_o
+  output logic                          done_o,
+  output logic [32-1:0]                 timing_total_cycles_o,
+  output logic [32-1:0]                 timing_load_cycles_o,
+  output logic [32-1:0]                 timing_compute_cycles_o,
+  output logic [32-1:0]                 timing_playback_cycles_o
 );
 
   localparam int unsigned STAGE_COUNT = (VECTOR_LEN <= 1) ? 1 : $clog2(VECTOR_LEN);
@@ -137,6 +141,9 @@ module butterfly_network #(
   logic signed [ACC_DW-1:0]             scaled_y1;
   logic signed [OUT_DW-1:0]             result_y0;
   logic signed [OUT_DW-1:0]             result_y1;
+  logic [32-1:0]                        load_cycle_count;
+  logic [32-1:0]                        compute_cycle_count;
+  logic [32-1:0]                        playback_cycle_count;
 
   function automatic logic signed [PROD_DW-1:0] mul_sample_weight;
     input logic signed [IN_DW-1:0] sample;
@@ -390,6 +397,13 @@ module butterfly_network #(
       y0_o <= '0;
       y1_o <= '0;
       done_o <= 1'b0;
+      timing_total_cycles_o <= 32'd0;
+      timing_load_cycles_o <= 32'd0;
+      timing_compute_cycles_o <= 32'd0;
+      timing_playback_cycles_o <= 32'd0;
+      load_cycle_count <= 32'd0;
+      compute_cycle_count <= 32'd0;
+      playback_cycle_count <= 32'd0;
     end else begin
       done_o <= 1'b0;
 
@@ -404,11 +418,20 @@ module butterfly_network #(
             pair_idx <= '0;
             read_bank <= 1'b0;
             playback_addr <= '0;
+            load_cycle_count <= 32'd0;
+            compute_cycle_count <= 32'd0;
+            playback_cycle_count <= 32'd0;
+            timing_total_cycles_o <= 32'd0;
+            timing_load_cycles_o <= 32'd0;
+            timing_compute_cycles_o <= 32'd0;
+            timing_playback_cycles_o <= 32'd0;
             state <= ST_LOAD;
           end
         end
 
         ST_LOAD: begin
+          load_cycle_count <= load_cycle_count + 1'b1;
+
           if (!samples_loaded && sample_valid_i) begin
             if (sample_wr_addr == LAST_SAMPLE_ADDR) begin
               samples_loaded <= 1'b1;
@@ -430,15 +453,18 @@ module butterfly_network #(
             stage_idx <= '0;
             pair_idx <= '0;
             read_bank <= 1'b0;
+            timing_load_cycles_o <= load_cycle_count + 1'b1;
             state <= ST_READ;
           end
         end
 
         ST_READ: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           state <= ST_LATCH;
         end
 
         ST_LATCH: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           if (!read_bank) begin
             sample_a <= bank0_dout_a;
             sample_b <= bank0_dout_b;
@@ -454,32 +480,40 @@ module butterfly_network #(
         end
 
         ST_MUL_A_Y0: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           acc_y0 <= {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
           state <= ST_MUL_B_Y0;
         end
 
         ST_MUL_B_Y0: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           acc_y0 <= acc_y0 + {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
           state <= ST_MUL_A_Y1;
         end
 
         ST_MUL_A_Y1: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           acc_y1 <= {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
           state <= ST_MUL_B_Y1;
         end
 
         ST_MUL_B_Y1: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           acc_y1 <= acc_y1 + {{(ACC_DW-PROD_DW){mul_product[PROD_DW-1]}}, mul_product};
           state <= ST_WRITE;
         end
 
         ST_WRITE: begin
+          compute_cycle_count <= compute_cycle_count + 1'b1;
           if (pair_idx == LAST_PAIR) begin
             pair_idx <= '0;
             if (stage_idx == LAST_STAGE) begin
               playback_addr <= '0;
               read_bank <= ~read_bank;
               done_o <= 1'b1;
+              timing_compute_cycles_o <= compute_cycle_count + 1'b1;
+              timing_total_cycles_o <= load_cycle_count + compute_cycle_count + 1'b1;
+              playback_cycle_count <= 32'd0;
               state <= ST_PLAYBACK;
             end else begin
               stage_idx <= stage_idx + 1'b1;
@@ -502,6 +536,13 @@ module butterfly_network #(
             pair_idx <= '0;
             read_bank <= 1'b0;
             playback_addr <= '0;
+            load_cycle_count <= 32'd0;
+            compute_cycle_count <= 32'd0;
+            playback_cycle_count <= 32'd0;
+            timing_total_cycles_o <= 32'd0;
+            timing_load_cycles_o <= 32'd0;
+            timing_compute_cycles_o <= 32'd0;
+            timing_playback_cycles_o <= 32'd0;
             state <= ST_LOAD;
           end else begin
             if (!read_bank) begin
@@ -514,8 +555,11 @@ module butterfly_network #(
 
             if (playback_addr >= LAST_SAMPLE_ADDR - 1'b1) begin
               playback_addr <= '0;
+              timing_playback_cycles_o <= playback_cycle_count + 1'b1;
+              playback_cycle_count <= 32'd0;
             end else begin
               playback_addr <= playback_addr + 2'd2;
+              playback_cycle_count <= playback_cycle_count + 1'b1;
             end
           end
         end

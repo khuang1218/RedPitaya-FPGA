@@ -22,6 +22,24 @@ Board-debug update from 2026-06-08:
 - The likely reader-side cause was overlapping AXI read burst requests caused
   by the delayed `axi_rd_burst.ctrl_busy_o` handshake. The newer DDR-reader
   handover records the fix in `bnet_axi_reader_ch.sv`.
+- A second reader-side bug was then fixed with an AXI-clock skid buffer between
+  `axi_rd_burst` and the async FIFO, preventing lost beats when the FIFO write
+  side was reset-busy/full.
+- Latest board tests now pass for the fixed `VECTOR_LEN=1024` DDR-backed staged
+  network:
+
+```text
+stream 0: 2048 / 2048 bytes consumed
+stream 1: 20480 / 20480 bytes consumed
+STATUS=0x12
+ERROR=0
+RF OUT1 loopback correlation against PC model: 0.994..1.000 across trials
+```
+
+- The remaining architectural goal is no longer fixing the fixed-length DDR
+  smoke path. The next milestone is larger input sizes and true DDR streaming:
+  overlap/refill ping-pong or ring buffers so the hardware runs at a higher
+  sustained rate instead of doing one software-uploaded batch per `BNET:START`.
 - Use `HANDOVER_bnet_ddr_reader_compile_check.md` for all DDR-mode debug,
   validation expectations, and remaining risks.
 

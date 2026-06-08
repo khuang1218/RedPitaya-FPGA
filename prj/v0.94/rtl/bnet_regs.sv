@@ -29,6 +29,12 @@
 //   0x4c  CONFIG RW [1:0] input source:
 //                    0 = ASG test stream, 1 = ADC real-time stream,
 //                    2 = DDR stream reserved
+//                 [2] auto-swap ping/pong buffers on compute done
+//                 [3] auto-restart after auto-swap on compute done
+//   0x50  TIME_TOTAL RO last start-to-done time in adc_clk cycles
+//   0x54  TIME_LOAD RO last DDR/load time in adc_clk cycles
+//   0x58  TIME_COMPUTE RO last staged compute time in adc_clk cycles
+//   0x5c  TIME_PLAYBACK RO last output playback period in adc_clk cycles
 //
 // Per-stream descriptor window:
 //   stream n base = 0x100 + n * 0x40
@@ -69,6 +75,10 @@ module bnet_regs #(
   input  logic          compute_busy_i,
   input  logic          compute_done_i,
   input  logic          compute_output_valid_i,
+  input  logic [32-1:0] timing_total_cycles_i,
+  input  logic [32-1:0] timing_load_cycles_i,
+  input  logic [32-1:0] timing_compute_cycles_i,
+  input  logic [32-1:0] timing_playback_cycles_i,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base0_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base1_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_length_o,
@@ -102,6 +112,10 @@ module bnet_regs #(
   localparam logic [20-1:0] REG_PENDING_MASK = 20'h00044;
   localparam logic [20-1:0] REG_ERROR_MASK   = 20'h00048;
   localparam logic [20-1:0] REG_CONFIG       = 20'h0004c;
+  localparam logic [20-1:0] REG_TIME_TOTAL   = 20'h00050;
+  localparam logic [20-1:0] REG_TIME_LOAD    = 20'h00054;
+  localparam logic [20-1:0] REG_TIME_COMPUTE = 20'h00058;
+  localparam logic [20-1:0] REG_TIME_PLAYBACK = 20'h0005c;
 
   localparam logic [20-1:0] STREAM_BASE   = 20'h00100;
   localparam logic [20-1:0] STREAM_STRIDE = 20'h00040;
@@ -119,6 +133,7 @@ module bnet_regs #(
   localparam logic [6-1:0] STREAM_REG_RPTR   = 6'h1c;
   localparam logic [6-1:0] STREAM_REG_DBG0   = 6'h20;
   localparam logic [6-1:0] STREAM_REG_DBG1   = 6'h24;
+  localparam logic [32-1:0] DEFAULT_VECTOR_LEN = 32'd2048;
 
   logic [32-1:0] control_reg;
   logic [32-1:0] status_reg;
@@ -137,6 +152,7 @@ module bnet_regs #(
   logic [STREAM_COUNT-1:0] stream_pending_buf;
   logic [STREAM_COUNT-1:0] stream_addr_error;
   logic [STREAM_COUNT-1:0] stream_len_error;
+  logic          auto_restart_allowed;
   logic          sys_en;
   logic          stream_access;
   logic [6-1:0] stream_slot;
@@ -149,6 +165,16 @@ module bnet_regs #(
   assign stream_slot = sys_addr_i[11:6] - STREAM_BASE[11:6];
   assign stream_index = stream_slot[0 +: STREAM_INDEX_W];
   assign stream_reg_offset = sys_addr_i[5:0];
+
+  always_comb begin
+    auto_restart_allowed = 1'b0;
+    for (int i = 0; i < STREAM_COUNT; i++) begin
+      if (stream_enable[i] && stream_pending_valid[i] &&
+          !stream_addr_error[i] && !stream_len_error[i] && !stream_runtime_error_i[i]) begin
+        auto_restart_allowed = 1'b1;
+      end
+    end
+  end
 
   assign out_data[0] = ch_data[0] + ch_data[1];
   assign out_data[1] = ch_data[2] + ch_data[3];
@@ -179,7 +205,7 @@ module bnet_regs #(
       config_reg  <= 32'd0;
       start_pulse_o <= 1'b0;
       soft_reset_pulse_o <= 1'b0;
-      vector_len_reg <= 32'd1024;
+      vector_len_reg <= DEFAULT_VECTOR_LEN;
       for (int i = 0; i < 8; i++) begin
         ch_data[i] <= 32'd0;
       end
@@ -202,6 +228,20 @@ module bnet_regs #(
       status_reg[0] <= compute_busy_i;
       if (compute_done_i) begin
         status_reg[1] <= 1'b1;
+        if (config_reg[2]) begin
+          for (int i = 0; i < STREAM_COUNT; i++) begin
+            if (stream_enable[i] && stream_pending_valid[i] &&
+                !stream_addr_error[i] && !stream_len_error[i] && !stream_runtime_error_i[i]) begin
+              stream_active_buf[i] <= stream_pending_buf[i];
+              stream_pending_valid[i] <= 1'b0;
+            end
+          end
+
+          if (config_reg[3] && auto_restart_allowed) begin
+            start_pulse_o <= 1'b1;
+            status_reg[1] <= 1'b0;
+          end
+        end
       end
       status_reg[2] <= 1'b0; // error: reserved for later buffer/controller work.
       status_reg[3] <= |stream_pending_valid;
@@ -215,7 +255,7 @@ module bnet_regs #(
               status_reg  <= 32'd0;
               config_reg  <= 32'd0;
               soft_reset_pulse_o <= 1'b1;
-              vector_len_reg <= 32'd1024;
+              vector_len_reg <= DEFAULT_VECTOR_LEN;
               for (int i = 0; i < 8; i++) begin
                 ch_data[i] <= 32'd0;
               end
@@ -350,6 +390,10 @@ module bnet_regs #(
         REG_ERROR_MASK:   sys_rdata_o <= {{(32-STREAM_COUNT){1'b0}},
                                           (stream_addr_error | stream_len_error | stream_runtime_error_i)};
         REG_CONFIG:       sys_rdata_o <= config_reg;
+        REG_TIME_TOTAL:   sys_rdata_o <= timing_total_cycles_i;
+        REG_TIME_LOAD:    sys_rdata_o <= timing_load_cycles_i;
+        REG_TIME_COMPUTE: sys_rdata_o <= timing_compute_cycles_i;
+        REG_TIME_PLAYBACK: sys_rdata_o <= timing_playback_cycles_i;
         default: begin
           if (stream_access) begin
             case (stream_reg_offset)

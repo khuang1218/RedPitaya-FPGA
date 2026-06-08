@@ -262,6 +262,10 @@ logic                    bnet_weight_ready;
 logic                    bnet_output_valid;
 logic                    bnet_busy;
 logic                    bnet_done;
+logic [32-1:0]           bnet_time_total_cycles;
+logic [32-1:0]           bnet_time_load_cycles;
+logic [32-1:0]           bnet_time_compute_cycles;
+logic [32-1:0]           bnet_time_playback_cycles;
 logic signed [14-1:0]    bnet_ddr_sample_dat;
 logic signed [14-1:0]    bnet_ddr_weight_dat;
 logic                    bnet_ddr_sample_valid;
@@ -756,7 +760,7 @@ butterfly_network #(
   .OUT_DW      (14),
   .WEIGHT_DW   (7),
   .WEIGHT_FRAC (6),
-  .VECTOR_LEN  (1024)
+  .VECTOR_LEN  (2048)
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
@@ -772,7 +776,11 @@ butterfly_network #(
   .y1_o     (butterfly_dat[1]),
   .output_valid_o (bnet_output_valid),
   .busy_o   (bnet_busy),
-  .done_o   (bnet_done)
+  .done_o   (bnet_done),
+  .timing_total_cycles_o (bnet_time_total_cycles),
+  .timing_load_cycles_o (bnet_time_load_cycles),
+  .timing_compute_cycles_o (bnet_time_compute_cycles),
+  .timing_playback_cycles_o (bnet_time_playback_cycles)
 );
 
 // Sign-extend the 14-bit butterfly outputs to the existing 15-bit saturation
@@ -1252,6 +1260,10 @@ red_pitaya_daisy  #(
     .compute_busy_i (bnet_busy),
     .compute_done_i (bnet_done),
     .compute_output_valid_i (bnet_output_valid),
+    .timing_total_cycles_i (bnet_time_total_cycles),
+    .timing_load_cycles_i (bnet_time_load_cycles),
+    .timing_compute_cycles_i (bnet_time_compute_cycles),
+    .timing_playback_cycles_i (bnet_time_playback_cycles),
     .stream_base0_o (bnet_stream_base0),
     .stream_base1_o (bnet_stream_base1),
     .stream_length_o(bnet_stream_length),

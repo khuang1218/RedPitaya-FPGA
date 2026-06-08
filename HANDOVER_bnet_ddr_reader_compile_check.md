@@ -2,6 +2,8 @@
 
 Date: 2026-06-04
 
+Latest board-test update: 2026-06-08
+
 Repository:
 
 ```text
@@ -35,6 +37,22 @@ axi3_sys -> BNET stream 1, packed weight data
 ```
 
 Normal ASG BRAM/table mode is intended to remain usable for test stimulus. ASG deep-memory mode is intentionally stubbed in this BNET bitstream.
+
+Current important caveat:
+
+- DDR is now working for the fixed `VECTOR_LEN=1024` batch transaction.
+- The current hardware still does:
+
+```text
+load fixed input/weight buffers from DDR
+  -> compute the complete staged network
+  -> loop playback to DAC
+```
+
+- It is not yet a true continuous streaming architecture. The next major
+  milestone is to expand vector size and overlap/refill DDR buffers so the FPGA
+  can sustain a higher rate instead of waiting for software to upload a fixed
+  buffer and issue one `BNET:START` per run.
 
 ## Files Changed
 
@@ -569,8 +587,80 @@ Fix applied in `bnet_axi_reader_ch.sv`:
 - Also connected FIFO `wr_rst_busy` and `rd_rst_busy`.
 - Gated FIFO write/read and AXI `rd_drdy_i` while FIFO reset is still busy.
 
-This fix has only been source-checked. It has not yet been synthesized or
-tested on hardware.
+This fix was later verified on board, but it was not sufficient by itself; the
+reader still needed an AXI-side skid buffer to avoid losing read data when the
+FIFO write side was not ready.
+
+### Bug 3: AXI read data could be lost at FIFO write boundary
+
+Symptom after the burst-handshake fix:
+
+- Stream 0 could complete, but stream 1 still stopped early on longer runs.
+- One representative result was stream 0 complete and stream 1 only
+  `14032/20480` bytes.
+
+Root cause:
+
+- AXI read data from `axi_rd_burst` was wired too directly into the async FIFO.
+- A valid AXI beat could arrive while the FIFO write side was reset-busy or
+  full.
+- Because there was no intermediate holding queue, that beat could be dropped,
+  and the reader would never deliver the complete configured stream.
+
+Fix applied in `bnet_axi_reader_ch.sv`:
+
+- Added a small AXI-clock skid buffer between `axi_rd_burst` and `asg_dat_fifo`.
+- AXI `rd_drdy_i` now follows skid-buffer capacity.
+- FIFO writes drain from the skid buffer only when `!fifo_wr_rst_busy` and
+  `!fifo_full`.
+- New debug outputs report skid-buffer ready/count/overflow plus AXI/FIFO state.
+- `can_request_axi` waits for the skid buffer to drain before issuing the next
+  AXI burst.
+
+Board confirmation after this fix:
+
+```text
+Payload sizes: stream0=2048 bytes, stream1=20480 bytes
+After START: status=0x12, active=0x0, pending=0x0, error=0x0
+Stream 0: status=0x4, rptr 0 -> 2048
+Stream 1: status=0x4, rptr 0 -> 20480
+```
+
+### Bug 4: RF OUT1 was compared to the wrong PC reference
+
+Symptom:
+
+- The digital DDR test passed, but the first RF multiple-input validation failed
+  with ramp correlation around `0.496`.
+
+Root cause:
+
+- `butterfly_network.sv` playback emits two final-vector samples per clock:
+
+```text
+DAC A / RF OUT1 = y0 = expected[0], expected[2], expected[4], ...
+DAC B / RF OUT2 = y1 = expected[1], expected[3], expected[5], ...
+```
+
+- The notebook compared RF OUT1 against the full 1024-sample PC reference
+  instead of the even-index OUT1/y0 half.
+
+Fix applied in the software notebook:
+
+- RF OUT1 capture now compares against `expected[0::2]`.
+- The RF capture cell prints a direct PC-reference correlation/RMSE/offset.
+- The multiple-input stability test uses a 512-sample OUT1/y0 reference window.
+
+Latest board result:
+
+```text
+ramp         corr=0.996 rmse=0.090 offset=1154 repeat_delta=nan
+sine         corr=1.000 rmse=0.013 offset=1347 repeat_delta=nan
+triangle     corr=0.994 rmse=0.110 offset=223  repeat_delta=nan
+cosine_mix   corr=0.998 rmse=0.073 offset=1175 repeat_delta=nan
+ramp_repeat  corr=0.996 rmse=0.090 offset=1031 repeat_delta=0.003
+Multiple-input RF validation and repeat-stability checks passed
+```
 
 ### Diagnostics still missing
 
@@ -600,12 +690,13 @@ into the reader or create a top-level starvation condition:
 DDR mode && compute_ready && !reader_valid
 ```
 
-### Remaining risks after the burst-handshake fix
+### Remaining risks after the reader fixes
 
-- If `stream0_rptr >= 2048` and `stream1_rptr >= 20480` but `STATUS[1]` still
-  does not assert, the next likely bug is inside `butterfly_network.sv`.
-- If either pointer still stops early, inspect AXI/FIFO behavior in
-  `bnet_axi_reader_ch.sv`.
+- If future larger-vector tests show early pointer stops again, inspect
+  skid-buffer overflow, FIFO reset-busy/full, and AXI backpressure first.
+- If `stream0_rptr` and `stream1_rptr` reach the expected byte counts but
+  `STATUS[1]` does not assert, the likely bug is inside `butterfly_network.sv`
+  load/compute FSM rather than the DDR readers.
 - Confirm the Vivado hierarchy has only BNET driving `axi2_sys` and `axi3_sys`;
   ASG deep-memory AXI should remain connected to dummy interfaces in this
   BNET bitstream.
@@ -670,10 +761,11 @@ After Vivado compile succeeds and software support is added or register writes a
 
 ## Known Incomplete Items
 
-- No Vivado compile/synthesis has been run yet.
-- The software/API/SCPI stream descriptors exist, but the notebook/proper BNET
-  correctness test must now upload `VECTOR_LEN * log2(VECTOR_LEN)` weight words
-  for stream 1.
+- The current board-proven design is still fixed-length/batch mode, not true
+  continuous streaming.
+- Input size has not yet been expanded beyond `VECTOR_LEN=1024`.
+- The software/API/SCPI stream descriptors and notebook correctness tests now
+  upload `VECTOR_LEN * log2(VECTOR_LEN)` weight words for stream 1.
 - `FORMAT` is stored/exported but not interpreted.
 - `stride_bytes_i` is only used for read pointer accounting, not actual lane skipping.
 - `READ_PTR` is now connected for streams 0 and 1. Streams 2..7 read as zero until additional readers/scheduler logic exist.
@@ -685,6 +777,68 @@ After Vivado compile succeeds and software support is added or register writes a
   compute latency is about `log2(1024) * 512 * 2 = 10240` clocks after loading.
 - DAC playback emits two final-vector samples per DAC clock, one on each output
   channel. It does not yet provide a selectable output formatting/routing mode.
+
+## Next Architecture Milestone: Bigger Vectors and Real DDR Streaming
+
+The current use of DDR proves that the FPGA can read larger raw buffers than the
+old ASG BRAM table path and can feed the staged engine correctly. However, it is
+still a batch transaction:
+
+```text
+software uploads a fixed input vector and fixed weight stream
+software commits descriptors
+software writes BNET:START
+hardware loads, computes, then loops playback
+```
+
+This has high end-to-end latency because every run is paced by SCPI/software
+setup and status polling. DDR should eventually be used to sustain higher data
+rates by keeping buffers filled ahead of the FPGA reader.
+
+Recommended next HDL work:
+
+1. Add hardware cycle counters:
+
+```text
+start-to-done cycles
+stream0 words delivered
+stream1 words delivered
+stream starvation/backpressure cycles
+playback period/cycles
+```
+
+2. Expand `VECTOR_LEN`:
+
+```text
+stream0 bytes = VECTOR_LEN * 2
+stream1 bytes = VECTOR_LEN * log2(VECTOR_LEN) * 2
+```
+
+Check BRAM utilization and timing after each size increase.
+
+3. Add a buffer scheduler:
+
+- ping/pong descriptor auto-advance, or
+- ring-buffer read pointers with software write pointers, plus
+- consumed-buffer/watermark status so software can refill DDR without stopping
+  the hardware.
+
+4. Decide the weight strategy:
+
+- if weights are static, load them once and reuse them across many input
+  vectors;
+- if weights change per vector, stream them with the input but hide upload time
+  behind compute/playback where possible.
+
+5. Overlap phases where possible:
+
+```text
+load vector N+1 while computing/outputting vector N
+```
+
+The current `butterfly_network` FSM does not overlap load, compute, and
+playback. Achieving the intended DDR-rate benefit will require either buffering
+between phases or a redesigned pipeline.
 
 ## Post-Implementation DRC Note
 

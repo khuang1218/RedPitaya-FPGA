@@ -88,6 +88,15 @@ module bnet_axi_reader_ch #(
   logic          fifo_wr_rst_busy;
   logic          fifo_rd_rst_busy;
 
+  logic [96-1:0] skid_mem [4];
+  logic [2-1:0]  skid_wr_ptr;
+  logic [2-1:0]  skid_rd_ptr;
+  logic [3-1:0]  skid_count;
+  logic          skid_push;
+  logic          skid_pop;
+  logic          skid_ready;
+  logic          skid_overflow_axi;
+
   logic          fifo_rd_pending;
   logic [AXI_DW-1:0] word_data;
   logic          word_valid;
@@ -99,10 +108,16 @@ module bnet_axi_reader_ch #(
   assign sample_o = word_data[(lane_index * 16) +: SAMPLE_DW];
   assign underrun_o = consume_i && !word_valid;
   assign ctrl_rsize = 3'h3;
-  assign fifo_wr = rd_dval && !fifo_wr_rst_busy && !fifo_full;
-  assign fifo_din = {rd_addr, rd_data};
+  assign skid_push = rd_dval;
+  assign skid_pop = (skid_count != 3'd0) && !fifo_wr_rst_busy && !fifo_full;
+  assign skid_ready = !fifo_wr_rst_busy && (skid_count <= 3'd2);
+  assign fifo_wr = skid_pop;
+  assign fifo_din = skid_mem[skid_rd_ptr];
   assign fifo_rst_cfg = !cfg_rstn_i || soft_reset_i || start_cfg_pulse;
-  assign debug0_o = {16'd0,
+  assign debug0_o = {11'd0,
+                     skid_overflow_axi,
+                     skid_ready,
+                     skid_count,
                      running_axi,
                      ctrl_req_inflight_axi,
                      ctrl_busy_seen_axi,
@@ -181,7 +196,36 @@ module bnet_axi_reader_ch #(
                       !ctrl_busy &&
                       !fifo_full &&
                       !fifo_wr_rst_busy &&
+                      (skid_count == 3'd0) &&
                       !ctrl_val;
+  end
+
+  always_ff @(posedge axi_sys.clk) begin
+    if (!axi_sys.rstn || soft_reset_axi_pulse || start_axi_pulse) begin
+      skid_wr_ptr <= '0;
+      skid_rd_ptr <= '0;
+      skid_count <= 3'd0;
+      skid_overflow_axi <= 1'b0;
+    end else begin
+      if (skid_push && (skid_count == 3'd4) && !skid_pop) begin
+        skid_overflow_axi <= 1'b1;
+      end
+
+      if (skid_push && ((skid_count != 3'd4) || skid_pop)) begin
+        skid_mem[skid_wr_ptr] <= {rd_addr, rd_data};
+        skid_wr_ptr <= skid_wr_ptr + 1'b1;
+      end
+
+      if (skid_pop) begin
+        skid_rd_ptr <= skid_rd_ptr + 1'b1;
+      end
+
+      unique case ({skid_push && ((skid_count != 3'd4) || skid_pop), skid_pop})
+        2'b10: skid_count <= skid_count + 1'b1;
+        2'b01: skid_count <= skid_count - 1'b1;
+        default: skid_count <= skid_count;
+      endcase
+    end
   end
 
   always_ff @(posedge axi_sys.clk) begin
@@ -303,7 +347,7 @@ module bnet_axi_reader_ch #(
     .rd_data_o    (rd_data),
     .rd_addr_o    (rd_addr),
     .rd_dval_o    (rd_dval),
-    .rd_drdy_i    (!fifo_full && !fifo_wr_rst_busy),
+    .rd_drdy_i    (skid_ready),
     .diags_o      (),
     .ctrl_busy_o  (ctrl_busy),
     .stat_busy_o  ()
