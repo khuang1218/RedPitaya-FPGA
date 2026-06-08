@@ -31,7 +31,9 @@ module bnet_axi_reader_ch #(
   output logic                         valid_o,
   output logic                         ready_o,
   output logic [32-1:0]                read_ptr_o,
-  output logic                         underrun_o
+  output logic                         underrun_o,
+  output logic [32-1:0]                debug0_o,
+  output logic [32-1:0]                debug1_o
 );
 
   localparam int unsigned AXI_BYTE_W = AXI_DW / 8;
@@ -93,11 +95,30 @@ module bnet_axi_reader_ch #(
 
   assign start_cfg_pulse = start_i && !start_cfg_d;
   assign ready_o = !fifo_empty || word_valid;
+  assign valid_o = word_valid;
+  assign sample_o = word_data[(lane_index * 16) +: SAMPLE_DW];
   assign underrun_o = consume_i && !word_valid;
   assign ctrl_rsize = 3'h3;
   assign fifo_wr = rd_dval && !fifo_wr_rst_busy && !fifo_full;
   assign fifo_din = {rd_addr, rd_data};
   assign fifo_rst_cfg = !cfg_rstn_i || soft_reset_i || start_cfg_pulse;
+  assign debug0_o = {16'd0,
+                     running_axi,
+                     ctrl_req_inflight_axi,
+                     ctrl_busy_seen_axi,
+                     ctrl_busy,
+                     ctrl_val,
+                     can_request_axi,
+                     fifo_wr_rst_busy,
+                     fifo_rd_rst_busy,
+                     fifo_full,
+                     fifo_empty,
+                     fifo_rd_pending,
+                     word_valid,
+                     fifo_rd,
+                     rd_dval,
+                     lane_index};
+  assign debug1_o = bytes_requested_axi;
 
   always_ff @(posedge cfg_clk_i) begin
     if (!cfg_rstn_i) begin
@@ -214,8 +235,6 @@ module bnet_axi_reader_ch #(
       word_data <= '0;
       word_valid <= 1'b0;
       lane_index <= '0;
-      sample_o <= '0;
-      valid_o <= 1'b0;
       read_ptr_o <= 32'd0;
     end else begin
       fifo_rd <= 1'b0;
@@ -225,7 +244,6 @@ module bnet_axi_reader_ch #(
         word_valid <= 1'b0;
         lane_index <= '0;
         read_ptr_o <= 32'd0;
-        valid_o <= 1'b0;
       end else begin
         if (!word_valid && !fifo_empty && !fifo_rd_pending && !fifo_rd_rst_busy) begin
           fifo_rd <= 1'b1;
@@ -240,14 +258,6 @@ module bnet_axi_reader_ch #(
         end
 
         if (word_valid) begin
-          valid_o <= 1'b1;
-        end else begin
-          valid_o <= 1'b0;
-        end
-
-        if (word_valid) begin
-          sample_o <= word_data[(lane_index * 16) +: SAMPLE_DW];
-
           if (consume_i) begin
             read_ptr_o <= read_ptr_o + stride_bytes_i;
 

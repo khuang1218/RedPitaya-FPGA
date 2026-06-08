@@ -77,6 +77,8 @@ module bnet_regs #(
   output logic [STREAM_COUNT-1:0] stream_enable_o,
   output logic [STREAM_COUNT-1:0] stream_active_buf_o,
   input  logic [STREAM_COUNT-1:0][32-1:0] stream_read_ptr_i,
+  input  logic [STREAM_COUNT-1:0][32-1:0] stream_debug0_i,
+  input  logic [STREAM_COUNT-1:0][32-1:0] stream_debug1_i,
   input  logic [STREAM_COUNT-1:0] stream_runtime_error_i
 );
 
@@ -115,6 +117,8 @@ module bnet_regs #(
   localparam logic [6-1:0] STREAM_REG_CTRL   = 6'h14;
   localparam logic [6-1:0] STREAM_REG_STATUS = 6'h18;
   localparam logic [6-1:0] STREAM_REG_RPTR   = 6'h1c;
+  localparam logic [6-1:0] STREAM_REG_DBG0   = 6'h20;
+  localparam logic [6-1:0] STREAM_REG_DBG1   = 6'h24;
 
   logic [32-1:0] control_reg;
   logic [32-1:0] status_reg;
@@ -363,6 +367,8 @@ module bnet_regs #(
                                                  stream_pending_valid[stream_index],
                                                  stream_active_buf[stream_index]};
               STREAM_REG_RPTR:   sys_rdata_o <= stream_read_ptr_i[stream_index];
+              STREAM_REG_DBG0:   sys_rdata_o <= stream_debug0_i[stream_index];
+              STREAM_REG_DBG1:   sys_rdata_o <= stream_debug1_i[stream_index];
               default:           sys_rdata_o <= 32'd0;
             endcase
           end else begin

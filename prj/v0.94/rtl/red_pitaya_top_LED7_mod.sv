@@ -268,6 +268,10 @@ logic                    bnet_ddr_sample_valid;
 logic                    bnet_ddr_weight_valid;
 logic [32-1:0]           bnet_ddr_sample_rptr;
 logic [32-1:0]           bnet_ddr_weight_rptr;
+logic [32-1:0]           bnet_ddr_sample_debug0;
+logic [32-1:0]           bnet_ddr_sample_debug1;
+logic [32-1:0]           bnet_ddr_weight_debug0;
+logic [32-1:0]           bnet_ddr_weight_debug1;
 logic                    bnet_ddr_sample_underrun;
 logic                    bnet_ddr_weight_underrun;
 logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_base0;
@@ -276,6 +280,8 @@ logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_length;
 logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_stride;
 logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_format;
 logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_read_ptr;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_debug0;
+logic [BNET_STREAM_COUNT-1:0][32-1:0] bnet_stream_debug1;
 logic [BNET_STREAM_COUNT-1:0]          bnet_stream_enable;
 logic [BNET_STREAM_COUNT-1:0]          bnet_stream_active_buf;
 logic [BNET_STREAM_COUNT-1:0]          bnet_stream_runtime_error;
@@ -340,6 +346,10 @@ assign asg_axi_b_dummy.rrdym = 1'b1;
 assign asg_axi_b_dummy.rardy = 1'b1;
 assign bnet_stream_read_ptr[0] = bnet_ddr_sample_rptr;
 assign bnet_stream_read_ptr[1] = bnet_ddr_weight_rptr;
+assign bnet_stream_debug0[0] = bnet_ddr_sample_debug0;
+assign bnet_stream_debug0[1] = bnet_ddr_weight_debug0;
+assign bnet_stream_debug1[0] = bnet_ddr_sample_debug1;
+assign bnet_stream_debug1[1] = bnet_ddr_weight_debug1;
 assign bnet_stream_runtime_error = {
   {(BNET_STREAM_COUNT-2){1'b0}},
   bnet_ddr_weight_underrun,
@@ -362,6 +372,8 @@ assign bnet_start_run = (bnet_input_sel == 2'd2) ? |bnet_start_stretch :
 generate
 for (genvar BNET_RPTR_IDX = 2; BNET_RPTR_IDX < BNET_STREAM_COUNT; BNET_RPTR_IDX++) begin : bnet_unused_rptr
   assign bnet_stream_read_ptr[BNET_RPTR_IDX] = 32'd0;
+  assign bnet_stream_debug0[BNET_RPTR_IDX] = 32'd0;
+  assign bnet_stream_debug1[BNET_RPTR_IDX] = 32'd0;
 end
 endgenerate
 ////////////////////////////////////////////////////////////////////////////////
@@ -675,7 +687,9 @@ bnet_axi_reader_ch #(
   .valid_o        (bnet_ddr_sample_valid),
   .ready_o        (),
   .read_ptr_o     (bnet_ddr_sample_rptr),
-  .underrun_o     (bnet_ddr_sample_underrun)
+  .underrun_o     (bnet_ddr_sample_underrun),
+  .debug0_o       (bnet_ddr_sample_debug0),
+  .debug1_o       (bnet_ddr_sample_debug1)
 );
 
 bnet_axi_reader_ch #(
@@ -697,7 +711,9 @@ bnet_axi_reader_ch #(
   .valid_o        (bnet_ddr_weight_valid),
   .ready_o        (),
   .read_ptr_o     (bnet_ddr_weight_rptr),
-  .underrun_o     (bnet_ddr_weight_underrun)
+  .underrun_o     (bnet_ddr_weight_underrun),
+  .debug0_o       (bnet_ddr_weight_debug0),
+  .debug1_o       (bnet_ddr_weight_debug1)
 );
 
 // Select the butterfly input source.
@@ -1244,6 +1260,8 @@ red_pitaya_daisy  #(
     .stream_enable_o(bnet_stream_enable),
     .stream_active_buf_o(bnet_stream_active_buf),
     .stream_read_ptr_i(bnet_stream_read_ptr),
+    .stream_debug0_i(bnet_stream_debug0),
+    .stream_debug1_i(bnet_stream_debug1),
     .stream_runtime_error_i(bnet_stream_runtime_error)
   );
 
