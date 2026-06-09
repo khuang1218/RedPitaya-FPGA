@@ -40,6 +40,12 @@ RF OUT1 loopback correlation against PC model: 0.994..1.000 across trials
   smoke path. The next milestone is larger input sizes and true DDR streaming:
   overlap/refill ping-pong or ring buffers so the hardware runs at a higher
   sustained rate instead of doing one software-uploaded batch per `BNET:START`.
+- Later source changes in this pass expanded the staged DDR build to
+  `VECTOR_LEN=2048`, added total/load/compute/playback timing counters, and
+  added guarded ping-pong auto-swap plus auto-restart bits in `CONFIG[2]` and
+  `CONFIG[3]`. Those source changes still need Vivado implementation and board
+  validation; the latest board-proven result remains the 1024-vector build
+  shown above.
 - Use `HANDOVER_bnet_ddr_reader_compile_check.md` for all DDR-mode debug,
   validation expectations, and remaining risks.
 

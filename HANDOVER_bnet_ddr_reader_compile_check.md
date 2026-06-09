@@ -4,6 +4,8 @@ Date: 2026-06-04
 
 Latest board-test update: 2026-06-08
 
+Latest source update: 2026-06-08 later pass
+
 Repository:
 
 ```text
@@ -40,7 +42,10 @@ Normal ASG BRAM/table mode is intended to remain usable for test stimulus. ASG d
 
 Current important caveat:
 
-- DDR is now working for the fixed `VECTOR_LEN=1024` batch transaction.
+- DDR is now board-proven for the fixed `VECTOR_LEN=1024` batch transaction.
+- The current source has since been expanded to `VECTOR_LEN=2048`, with
+  timing counters and guarded ping-pong auto-swap/auto-restart support. Rebuild
+  and board-test this newer source before treating the 2048 path as validated.
 - The current hardware still does:
 
 ```text
@@ -103,7 +108,11 @@ New global registers:
 0x40 ACTIVE_MASK     RO, one bit per stream, 1 means pong/base1 active
 0x44 PENDING_MASK    RO, one bit per stream, swap pending
 0x48 ERROR_MASK      RO, one bit per stream, descriptor error
-0x4c CONFIG          RW, BNET input source
+0x4c CONFIG          RW, BNET input source plus ping-pong controls
+0x50 TIME_TOTAL      RO, last start-to-done cycle count
+0x54 TIME_LOAD       RO, last load-state cycle count
+0x58 TIME_COMPUTE    RO, last compute-state cycle count
+0x5c TIME_PLAYBACK   RO, last playback cycle count
 ```
 
 `CONFIG[1:0]`:
@@ -113,6 +122,17 @@ New global registers:
 1 = ADC real-time stream: sample=ADC A, weight=ASG B
 2 = DDR stream: sample=stream 0, weight=stream 1
 ```
+
+Additional `CONFIG` bits:
+
+```text
+bit 2 = auto-swap to a valid pending ping/pong buffer when compute finishes
+bit 3 = auto-restart after a successful auto-swap
+```
+
+Auto-restart is guarded: it only fires when every enabled stream has a valid
+pending inactive buffer and no descriptor/runtime error. Software must commit
+the next inactive buffer while the current run is still active.
 
 Per-stream descriptor window:
 
@@ -223,10 +243,10 @@ full-network hardware pass.
 Default build shape:
 
 ```text
-VECTOR_LEN = 1024
-STAGE_COUNT = log2(VECTOR_LEN) = 10
-PAIR_COUNT = VECTOR_LEN / 2 = 512 butterflies per stage
-TOTAL_WEIGHTS = STAGE_COUNT * VECTOR_LEN = 10240 packed weight words
+VECTOR_LEN = 2048
+STAGE_COUNT = log2(VECTOR_LEN) = 11
+PAIR_COUNT = VECTOR_LEN / 2 = 1024 butterflies per stage
+TOTAL_WEIGHTS = STAGE_COUNT * VECTOR_LEN = 22528 packed weight words
 ```
 
 Each packed weight word is still 14 bits:
@@ -306,6 +326,13 @@ For `VECTOR_LEN=1024`:
 ```text
 stream 0 length = 2048 bytes
 stream 1 length = 20480 bytes
+```
+
+For the current `VECTOR_LEN=2048` source:
+
+```text
+stream 0 length = 4096 bytes
+stream 1 length = 45056 bytes
 ```
 
 `bnet_regs.sv` now receives compute status from the butterfly engine:
@@ -432,9 +459,9 @@ output_valid_o, busy_o, done_o
 `butterfly_network.sv` now contains:
 
 ```text
-bank0_ram: 1024 x 14
-bank1_ram: 1024 x 14
-weight_ram: 10240 x 14
+bank0_ram: 2048 x 14
+bank1_ram: 2048 x 14
+weight_ram: 22528 x 14
 ```
 
 Vivado should infer BRAM or distributed RAM. Check utilization. If it maps too
@@ -549,8 +576,8 @@ At timeout:
 Expected consumption for the full staged smoke test:
 
 ```text
-stream 0 = 2048 bytes
-stream 1 = 20480 bytes
+stream 0 = 4096 bytes
+stream 1 = 45056 bytes
 ```
 
 Interpretation:
@@ -748,7 +775,9 @@ After Vivado compile succeeds and software support is added or register writes a
 3. Set BNET DDR input mode:
 
 ```text
-0x4c CONFIG = 2
+0x4c CONFIG = 2   DDR one-shot
+0x4c CONFIG = 6   DDR + auto-swap
+0x4c CONFIG = 14  DDR + auto-swap + auto-restart
 ```
 
 4. Start BNET:
@@ -763,7 +792,8 @@ After Vivado compile succeeds and software support is added or register writes a
 
 - The current board-proven design is still fixed-length/batch mode, not true
   continuous streaming.
-- Input size has not yet been expanded beyond `VECTOR_LEN=1024`.
+- Source has been expanded to `VECTOR_LEN=2048`, but that build still needs
+  Vivado implementation and board validation before it is considered proven.
 - The software/API/SCPI stream descriptors and notebook correctness tests now
   upload `VECTOR_LEN * log2(VECTOR_LEN)` weight words for stream 1.
 - `FORMAT` is stored/exported but not interpreted.
@@ -772,9 +802,11 @@ After Vivado compile succeeds and software support is added or register writes a
 - Reader underrun/runtime error is reflected into `ERROR_MASK` and per-stream `STATUS[5]`, but it is not latched. It reflects current reader behavior rather than a sticky fault history.
 - The reader currently assumes contiguous 16-bit packed sample lanes in DDR.
 - There is still no multi-stream scheduler for streams 2..7.
-- The full butterfly engine computes one butterfly over two clocks, so it is not
-  a one-sample-per-clock fully parallel implementation. For `VECTOR_LEN=1024`,
-  compute latency is about `log2(1024) * 512 * 2 = 10240` clocks after loading.
+- The full butterfly engine is serial rather than a one-sample-per-clock fully
+  parallel implementation. Use the timing counters for the real source build;
+  the older rough 1024-build estimate was about
+  `log2(1024) * 512 * 2 = 10240` clocks after loading before multiplier
+  serialization.
 - DAC playback emits two final-vector samples per DAC clock, one on each output
   channel. It does not yet provide a selectable output formatting/routing mode.
 
@@ -797,28 +829,28 @@ rates by keeping buffers filled ahead of the FPGA reader.
 
 Recommended next HDL work:
 
-1. Add hardware cycle counters:
+1. Use and extend hardware cycle counters:
 
 ```text
-start-to-done cycles
+total/load/compute/playback cycles are now implemented
 stream0 words delivered
 stream1 words delivered
 stream starvation/backpressure cycles
-playback period/cycles
 ```
 
-2. Expand `VECTOR_LEN`:
+2. Validate `VECTOR_LEN=2048`, then expand further:
 
 ```text
 stream0 bytes = VECTOR_LEN * 2
 stream1 bytes = VECTOR_LEN * log2(VECTOR_LEN) * 2
 ```
 
-Check BRAM utilization and timing after each size increase.
+Check BRAM utilization and timing at 2048 first, then after each size increase.
 
-3. Add a buffer scheduler:
+3. Extend the buffer scheduler:
 
-- ping/pong descriptor auto-advance, or
+- guarded ping/pong auto-swap/auto-restart is now implemented for the current
+  descriptor model
 - ring-buffer read pointers with software write pointers, plus
 - consumed-buffer/watermark status so software can refill DDR without stopping
   the hardware.
@@ -949,8 +981,9 @@ If RAM inferencing intended, write to one port per process.
 
 This was not a butterfly-network math problem. The `bnet_tdp_ram` wrapper used
 one `always_ff` block for both true-dual-port write ports, and Vivado 2020.1 did
-not recognize that as a supported BRAM template. Because the weight RAM is
-`10240 x 14` bits, Vivado could not safely dissolve it into registers/LUTs.
+not recognize that as a supported BRAM template. Because the weight RAM is large
+(`10240 x 14` bits in the board-proven 1024 build, now `22528 x 14` bits in the
+2048 source), Vivado could not safely dissolve it into registers/LUTs.
 
 Fix applied:
 
