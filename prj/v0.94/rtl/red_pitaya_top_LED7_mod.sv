@@ -250,6 +250,9 @@ SBG_T [2-1:0]            butterfly_dat;
 SBG_T                    bnet_sample_dat;
 logic signed [14-1:0]    bnet_weight_dat;
 logic [2-1:0]            bnet_input_sel;
+logic                    bnet_static_weight_reuse;
+logic                    bnet_static_pipeline_en;
+logic                    bnet_static_pipeline_active;
 logic                    bnet_start_pulse;
 logic                    bnet_soft_reset_pulse;
 logic [4-1:0]            bnet_start_stretch;
@@ -266,6 +269,25 @@ logic [32-1:0]           bnet_time_total_cycles;
 logic [32-1:0]           bnet_time_load_cycles;
 logic [32-1:0]           bnet_time_compute_cycles;
 logic [32-1:0]           bnet_time_playback_cycles;
+SBG_T [2-1:0]            bnet_serial_dat;
+logic                    bnet_serial_sample_ready;
+logic                    bnet_serial_weight_ready;
+logic                    bnet_serial_output_valid;
+logic                    bnet_serial_busy;
+logic                    bnet_serial_done;
+logic [32-1:0]           bnet_serial_time_total_cycles;
+logic [32-1:0]           bnet_serial_time_load_cycles;
+logic [32-1:0]           bnet_serial_time_compute_cycles;
+logic [32-1:0]           bnet_serial_time_playback_cycles;
+SBG_T [2-1:0]            bnet_pipe_dat;
+logic                    bnet_pipe_sample_ready;
+logic                    bnet_pipe_weight_ready;
+logic                    bnet_pipe_weight_done;
+logic                    bnet_pipe_output_valid;
+logic                    bnet_pipe_busy;
+logic                    bnet_pipe_done;
+logic [32-1:0]           bnet_pipe_time_output_cycles;
+logic                    bnet_weight_stream_active;
 logic signed [14-1:0]    bnet_ddr_sample_dat;
 logic signed [14-1:0]    bnet_ddr_weight_dat;
 logic                    bnet_ddr_sample_valid;
@@ -359,6 +381,28 @@ assign bnet_stream_runtime_error = {
   bnet_ddr_weight_underrun,
   bnet_ddr_sample_underrun
 };
+
+assign bnet_static_pipeline_active = bnet_static_pipeline_en && (bnet_input_sel == 2'd2);
+assign bnet_weight_stream_active = bnet_static_pipeline_active ? !bnet_pipe_weight_done :
+                                                             !bnet_static_weight_reuse;
+assign bnet_sample_ready = bnet_static_pipeline_active ? bnet_pipe_sample_ready :
+                                                     bnet_serial_sample_ready;
+assign bnet_weight_ready = bnet_static_pipeline_active ? bnet_pipe_weight_ready :
+                                                     bnet_serial_weight_ready;
+assign butterfly_dat[0] = bnet_static_pipeline_active ? bnet_pipe_dat[0] : bnet_serial_dat[0];
+assign butterfly_dat[1] = bnet_static_pipeline_active ? bnet_pipe_dat[1] : bnet_serial_dat[1];
+assign bnet_output_valid = bnet_static_pipeline_active ? bnet_pipe_output_valid :
+                                                     bnet_serial_output_valid;
+assign bnet_busy = bnet_static_pipeline_active ? bnet_pipe_busy : bnet_serial_busy;
+assign bnet_done = bnet_static_pipeline_active ? bnet_pipe_done : bnet_serial_done;
+assign bnet_time_total_cycles = bnet_static_pipeline_active ? bnet_pipe_time_output_cycles :
+                                                          bnet_serial_time_total_cycles;
+assign bnet_time_load_cycles = bnet_static_pipeline_active ? 32'd0 :
+                                                         bnet_serial_time_load_cycles;
+assign bnet_time_compute_cycles = bnet_static_pipeline_active ? 32'd0 :
+                                                            bnet_serial_time_compute_cycles;
+assign bnet_time_playback_cycles = bnet_static_pipeline_active ? bnet_pipe_time_output_cycles :
+                                                             bnet_serial_time_playback_cycles;
 
 always_ff @(posedge adc_clk) begin
   if (!adc_rstn || bnet_soft_reset_pulse) begin
@@ -702,14 +746,15 @@ bnet_axi_reader_ch #(
   .cfg_clk_i      (adc_clk),
   .cfg_rstn_i     (adc_rstn),
   .soft_reset_i   (bnet_soft_reset_pulse),
-  .start_i        (bnet_start_run && (bnet_input_sel == 2'd2)),
+  .start_i        (bnet_start_run && (bnet_input_sel == 2'd2) && bnet_weight_stream_active),
   .enable_i       (bnet_stream_enable[1]),
   .active_buf_i   (bnet_stream_active_buf[1]),
   .base0_i        (bnet_stream_base0[1]),
   .base1_i        (bnet_stream_base1[1]),
   .length_bytes_i (bnet_stream_length[1]),
   .stride_bytes_i (bnet_stream_stride[1]),
-  .consume_i      ((bnet_input_sel == 2'd2) && bnet_weight_ready && bnet_ddr_weight_valid),
+  .consume_i      ((bnet_input_sel == 2'd2) && bnet_weight_stream_active &&
+                   bnet_weight_ready && bnet_ddr_weight_valid),
   .axi_sys        (axi3_sys),
   .sample_o       (bnet_ddr_weight_dat),
   .valid_o        (bnet_ddr_weight_valid),
@@ -766,21 +811,50 @@ butterfly_network #(
   .rstn_i   (adc_rstn),
   .soft_reset_i (bnet_soft_reset_pulse),
   .start_i  (bnet_start),
-  .sample_valid_i (bnet_sample_valid),
-  .sample_ready_o (bnet_sample_ready),
+  .sample_valid_i (!bnet_static_pipeline_active && bnet_sample_valid),
+  .sample_ready_o (bnet_serial_sample_ready),
   .sample_i (bnet_sample_dat),
-  .weight_valid_i (bnet_weight_valid),
-  .weight_ready_o (bnet_weight_ready),
+  .reuse_weights_i (bnet_static_weight_reuse),
+  .weight_valid_i (!bnet_static_pipeline_active && bnet_weight_valid),
+  .weight_ready_o (bnet_serial_weight_ready),
   .weight_i (bnet_weight_dat),
-  .y0_o     (butterfly_dat[0]),
-  .y1_o     (butterfly_dat[1]),
-  .output_valid_o (bnet_output_valid),
-  .busy_o   (bnet_busy),
-  .done_o   (bnet_done),
-  .timing_total_cycles_o (bnet_time_total_cycles),
-  .timing_load_cycles_o (bnet_time_load_cycles),
-  .timing_compute_cycles_o (bnet_time_compute_cycles),
-  .timing_playback_cycles_o (bnet_time_playback_cycles)
+  .y0_o     (bnet_serial_dat[0]),
+  .y1_o     (bnet_serial_dat[1]),
+  .output_valid_o (bnet_serial_output_valid),
+  .busy_o   (bnet_serial_busy),
+  .done_o   (bnet_serial_done),
+  .timing_total_cycles_o (bnet_serial_time_total_cycles),
+  .timing_load_cycles_o (bnet_serial_time_load_cycles),
+  .timing_compute_cycles_o (bnet_serial_time_compute_cycles),
+  .timing_playback_cycles_o (bnet_serial_time_playback_cycles)
+);
+
+// Fixed-weight frame-pipeline draft. This path preloads static weights from
+// stream 1, then accepts input frames from stream 0. It is selected by CONFIG[5].
+butterfly_network_static_pipeline #(
+  .IN_DW       (14),
+  .OUT_DW      (14),
+  .WEIGHT_DW   (7),
+  .WEIGHT_FRAC (6),
+  .VECTOR_LEN  (2048)
+) i_butterfly_static_pipeline (
+  .clk_i    (adc_clk),
+  .rstn_i   (adc_rstn),
+  .soft_reset_i (bnet_soft_reset_pulse),
+  .weight_load_valid_i (bnet_static_pipeline_active && bnet_weight_valid),
+  .weight_load_ready_o (bnet_pipe_weight_ready),
+  .weight_load_i (bnet_weight_dat),
+  .weight_load_done_o (bnet_pipe_weight_done),
+  .sample_valid_i (bnet_static_pipeline_active && bnet_sample_valid),
+  .sample_ready_o (bnet_pipe_sample_ready),
+  .sample_i (bnet_sample_dat),
+  .y0_o (bnet_pipe_dat[0]),
+  .y1_o (bnet_pipe_dat[1]),
+  .output_valid_o (bnet_pipe_output_valid),
+  .output_ready_i (1'b1),
+  .busy_o (bnet_pipe_busy),
+  .done_o (bnet_pipe_done),
+  .timing_output_cycles_o (bnet_pipe_time_output_cycles)
 );
 
 // Sign-extend the 14-bit butterfly outputs to the existing 15-bit saturation
@@ -1255,6 +1329,8 @@ red_pitaya_daisy  #(
     .led_debug_en_o (bnet_led_debug_en),
     .led6_heartbeat_en_o (bnet_led6_heartbeat_en),
     .input_sel_o    (bnet_input_sel),
+    .static_weight_reuse_o (bnet_static_weight_reuse),
+    .static_pipeline_en_o (bnet_static_pipeline_en),
     .start_pulse_o  (bnet_start_pulse),
     .soft_reset_pulse_o (bnet_soft_reset_pulse),
     .compute_busy_i (bnet_busy),

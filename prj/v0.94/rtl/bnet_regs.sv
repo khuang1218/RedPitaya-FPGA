@@ -31,6 +31,8 @@
 //                    2 = DDR stream reserved
 //                 [2] auto-swap ping/pong buffers on compute done
 //                 [3] auto-restart after auto-swap on compute done
+//                 [4] reuse preloaded static butterfly weights
+//                 [5] select fixed-weight frame pipeline
 //   0x50  TIME_TOTAL RO last start-to-done time in adc_clk cycles
 //   0x54  TIME_LOAD RO last DDR/load time in adc_clk cycles
 //   0x58  TIME_COMPUTE RO last staged compute time in adc_clk cycles
@@ -70,6 +72,8 @@ module bnet_regs #(
   output logic          led_debug_en_o,
   output logic          led6_heartbeat_en_o,
   output logic [ 2-1:0] input_sel_o,
+  output logic          static_weight_reuse_o,
+  output logic          static_pipeline_en_o,
   output logic          start_pulse_o,
   output logic          soft_reset_pulse_o,
   input  logic          compute_busy_i,
@@ -185,6 +189,8 @@ module bnet_regs #(
   assign led_debug_en_o = control_reg[2];
   assign led6_heartbeat_en_o = control_reg[3];
   assign input_sel_o = config_reg[1:0];
+  assign static_weight_reuse_o = config_reg[4];
+  assign static_pipeline_en_o = config_reg[5];
   assign stream_enable_o = stream_enable;
   assign stream_active_buf_o = stream_active_buf;
 

@@ -37,6 +37,7 @@ module butterfly_network #(
   output logic                          sample_ready_o,
   input  logic signed [IN_DW-1:0]       sample_i,
 
+  input  logic                          reuse_weights_i,
   input  logic                          weight_valid_i,
   output logic                          weight_ready_o,
   input  logic signed [2*WEIGHT_DW-1:0] weight_i,
@@ -275,7 +276,7 @@ module butterfly_network #(
 
         weight_addr_port_a = weight_wr_addr;
         weight_din_a = weight_i;
-        weight_we_a = !weights_loaded && weight_valid_i;
+        weight_we_a = !reuse_weights_i && !weights_loaded && weight_valid_i;
       end
 
       ST_READ: begin
@@ -325,7 +326,7 @@ module butterfly_network #(
   end
 
   assign sample_ready_o = (state == ST_LOAD) && !samples_loaded;
-  assign weight_ready_o = (state == ST_LOAD) && !weights_loaded;
+  assign weight_ready_o = (state == ST_LOAD) && !reuse_weights_i && !weights_loaded;
   assign busy_o = (state != ST_IDLE) && (state != ST_PLAYBACK);
   assign output_valid_o = (state == ST_PLAYBACK);
 
@@ -413,7 +414,7 @@ module butterfly_network #(
             sample_wr_addr <= '0;
             weight_wr_addr <= '0;
             samples_loaded <= 1'b0;
-            weights_loaded <= 1'b0;
+            weights_loaded <= reuse_weights_i;
             stage_idx <= '0;
             pair_idx <= '0;
             read_bank <= 1'b0;
@@ -440,7 +441,7 @@ module butterfly_network #(
             end
           end
 
-          if (!weights_loaded && weight_valid_i) begin
+          if (!reuse_weights_i && !weights_loaded && weight_valid_i) begin
             if (weight_wr_addr == LAST_WEIGHT_ADDR) begin
               weights_loaded <= 1'b1;
             end else begin
@@ -449,7 +450,9 @@ module butterfly_network #(
           end
 
           if ((samples_loaded || (sample_valid_i && (sample_wr_addr == LAST_SAMPLE_ADDR))) &&
-              (weights_loaded || (weight_valid_i && (weight_wr_addr == LAST_WEIGHT_ADDR)))) begin
+              (weights_loaded ||
+               reuse_weights_i ||
+               (weight_valid_i && (weight_wr_addr == LAST_WEIGHT_ADDR)))) begin
             stage_idx <= '0;
             pair_idx <= '0;
             read_bank <= 1'b0;
@@ -531,7 +534,7 @@ module butterfly_network #(
             sample_wr_addr <= '0;
             weight_wr_addr <= '0;
             samples_loaded <= 1'b0;
-            weights_loaded <= 1'b0;
+            weights_loaded <= reuse_weights_i;
             stage_idx <= '0;
             pair_idx <= '0;
             read_bank <= 1'b0;
