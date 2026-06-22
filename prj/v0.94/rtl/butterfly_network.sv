@@ -45,6 +45,7 @@ module butterfly_network #(
   output logic signed [OUT_DW-1:0]      y0_o,
   output logic signed [OUT_DW-1:0]      y1_o,
   output logic                          output_valid_o,
+  input  logic                          output_ready_i,
   output logic                          busy_o,
   output logic                          done_o,
   output logic [32-1:0]                 timing_total_cycles_o,
@@ -548,21 +549,24 @@ module butterfly_network #(
             timing_playback_cycles_o <= 32'd0;
             state <= ST_LOAD;
           end else begin
-            if (!read_bank) begin
-              y0_o <= bank0_dout_a;
-              y1_o <= bank0_dout_b;
-            end else begin
-              y0_o <= bank1_dout_a;
-              y1_o <= bank1_dout_b;
-            end
+            playback_cycle_count <= playback_cycle_count + 1'b1;
 
-            if (playback_addr >= LAST_SAMPLE_ADDR - 1'b1) begin
-              playback_addr <= '0;
-              timing_playback_cycles_o <= playback_cycle_count + 1'b1;
-              playback_cycle_count <= 32'd0;
-            end else begin
-              playback_addr <= playback_addr + 2'd2;
-              playback_cycle_count <= playback_cycle_count + 1'b1;
+            if (output_ready_i) begin
+              if (!read_bank) begin
+                y0_o <= bank0_dout_a;
+                y1_o <= bank0_dout_b;
+              end else begin
+                y0_o <= bank1_dout_a;
+                y1_o <= bank1_dout_b;
+              end
+
+              if (playback_addr >= LAST_SAMPLE_ADDR - 1'b1) begin
+                playback_addr <= '0;
+                timing_playback_cycles_o <= playback_cycle_count + 1'b1;
+                playback_cycle_count <= 32'd0;
+              end else begin
+                playback_addr <= playback_addr + 2'd2;
+              end
             end
           end
         end

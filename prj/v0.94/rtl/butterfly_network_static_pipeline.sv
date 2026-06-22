@@ -43,6 +43,10 @@ module butterfly_network_static_pipeline #(
 
   output logic                          busy_o,
   output logic                          done_o,
+  output logic [32-1:0]                 timing_total_cycles_o,
+  output logic [32-1:0]                 timing_weight_load_cycles_o,
+  output logic [32-1:0]                 timing_input_load_cycles_o,
+  output logic [32-1:0]                 timing_latency_cycles_o,
   output logic [32-1:0]                 timing_output_cycles_o
 );
 
@@ -97,10 +101,28 @@ module butterfly_network_static_pipeline #(
   logic output_active;
   logic output_bank;
   logic [ADDR_W-1:0] output_addr;
+  logic weight_load_active;
+  logic input_load_active;
+  logic latency_active;
+  logic total_active;
+  logic [32-1:0] weight_load_cycle_count;
+  logic [32-1:0] input_load_cycle_count;
+  logic [32-1:0] latency_cycle_count;
+  logic [32-1:0] total_cycle_count;
+  logic [32-1:0] output_cycle_count;
+  logic accepted_weight;
+  logic accepted_sample;
+  logic first_output_sample;
+  logic final_output_sample;
 
   assign sample_ready_o = weight_load_done_o && !input_frame_valid[sample_wr_bank];
   assign busy_o = output_active || (|stage_busy) || (input_frame_valid != 2'b00) ||
                   (|stage_frame_valid);
+  assign accepted_weight = weight_load_valid_i && weight_load_ready_o;
+  assign accepted_sample = sample_valid_i && sample_ready_o;
+  assign first_output_sample = output_active && output_ready_i && (output_addr == '0);
+  assign final_output_sample = output_active && output_ready_i &&
+                               (output_addr >= LAST_SAMPLE_ADDR - 1'b1);
 
   always_comb begin
     input_addr_a = stage_src_addr_a[0];
@@ -212,25 +234,74 @@ module butterfly_network_static_pipeline #(
       done_o <= 1'b0;
       y0_o <= '0;
       y1_o <= '0;
+      weight_load_active <= 1'b0;
+      input_load_active <= 1'b0;
+      latency_active <= 1'b0;
+      total_active <= 1'b0;
+      weight_load_cycle_count <= 32'd0;
+      input_load_cycle_count <= 32'd0;
+      latency_cycle_count <= 32'd0;
+      total_cycle_count <= 32'd0;
+      output_cycle_count <= 32'd0;
+      timing_total_cycles_o <= 32'd0;
+      timing_weight_load_cycles_o <= 32'd0;
+      timing_input_load_cycles_o <= 32'd0;
+      timing_latency_cycles_o <= 32'd0;
       timing_output_cycles_o <= 32'd0;
     end else begin
       stage_start <= '0;
       output_valid_o <= 1'b0;
       done_o <= 1'b0;
 
-      if (weight_load_valid_i && weight_load_ready_o) begin
+      if (!total_active && (accepted_weight || accepted_sample)) begin
+        total_active <= 1'b1;
+        total_cycle_count <= 32'd1;
+      end else if (total_active) begin
+        total_cycle_count <= total_cycle_count + 1'b1;
+      end
+
+      if (accepted_weight && !weight_load_active) begin
+        weight_load_active <= 1'b1;
+        weight_load_cycle_count <= 32'd1;
+      end else if (weight_load_active) begin
+        weight_load_cycle_count <= weight_load_cycle_count + 1'b1;
+      end
+
+      if (accepted_sample && !input_load_active) begin
+        input_load_active <= 1'b1;
+        input_load_cycle_count <= 32'd1;
+      end else if (input_load_active) begin
+        input_load_cycle_count <= input_load_cycle_count + 1'b1;
+      end
+
+      if (latency_active) begin
+        latency_cycle_count <= latency_cycle_count + 1'b1;
+      end
+
+      if (accepted_weight) begin
         if (weight_load_addr == LAST_WEIGHT_LOAD_ADDR) begin
           weight_load_done_o <= 1'b1;
+          weight_load_active <= 1'b0;
+          timing_weight_load_cycles_o <= weight_load_active ?
+                                         (weight_load_cycle_count + 1'b1) :
+                                         32'd1;
         end else begin
           weight_load_addr <= weight_load_addr + 1'b1;
         end
       end
 
-      if (sample_valid_i && sample_ready_o) begin
+      if (accepted_sample) begin
         if (sample_wr_addr == LAST_SAMPLE_ADDR) begin
           input_frame_valid[sample_wr_bank] <= 1'b1;
           sample_wr_bank <= ~sample_wr_bank;
           sample_wr_addr <= '0;
+          input_load_active <= 1'b0;
+          latency_active <= 1'b1;
+          latency_cycle_count <= 32'd0;
+          output_cycle_count <= 32'd0;
+          timing_input_load_cycles_o <= input_load_active ?
+                                        (input_load_cycle_count + 1'b1) :
+                                        32'd1;
         end else begin
           sample_wr_addr <= sample_wr_addr + 1'b1;
         end
@@ -265,19 +336,34 @@ module butterfly_network_static_pipeline #(
         output_bank <= stage_frame_valid[STAGE_COUNT-1][0] ? 1'b0 : 1'b1;
         stage_frame_valid[STAGE_COUNT-1][stage_frame_valid[STAGE_COUNT-1][0] ? 1'b0 : 1'b1] <= 1'b0;
         output_addr <= '0;
+        output_cycle_count <= 32'd0;
         timing_output_cycles_o <= 32'd0;
-      end else if (output_active && output_ready_i) begin
-        y0_o <= stage_out_rd_data_a[STAGE_COUNT-1];
-        y1_o <= stage_out_rd_data_b[STAGE_COUNT-1];
-        output_valid_o <= 1'b1;
-        timing_output_cycles_o <= timing_output_cycles_o + 1'b1;
+      end else if (output_active) begin
+        output_cycle_count <= output_cycle_count + 1'b1;
 
-        if (output_addr >= LAST_SAMPLE_ADDR - 1'b1) begin
-          output_active <= 1'b0;
-          done_o <= 1'b1;
-          output_addr <= '0;
-        end else begin
-          output_addr <= output_addr + 2'd2;
+        if (output_ready_i) begin
+          y0_o <= stage_out_rd_data_a[STAGE_COUNT-1];
+          y1_o <= stage_out_rd_data_b[STAGE_COUNT-1];
+          output_valid_o <= 1'b1;
+
+          if (first_output_sample) begin
+            latency_active <= 1'b0;
+            timing_latency_cycles_o <= latency_active ?
+                                       (latency_cycle_count + 1'b1) :
+                                       32'd1;
+          end
+
+          if (final_output_sample) begin
+            output_active <= 1'b0;
+            done_o <= 1'b1;
+            output_addr <= '0;
+            total_active <= 1'b0;
+            timing_output_cycles_o <= output_cycle_count + 1'b1;
+            timing_total_cycles_o <= total_active ? (total_cycle_count + 1'b1) :
+                                                    32'd1;
+          end else begin
+            output_addr <= output_addr + 2'd2;
+          end
         end
       end
     end

@@ -234,6 +234,13 @@ logic                 can_on;
 localparam type SBA_T = logic signed [ADW-1:0];  // acquire
 localparam type SBG_T = logic signed [ 14-1:0];  // generate
 localparam int unsigned BNET_STREAM_COUNT = 8;
+localparam int unsigned BNET_SERIAL_VECTOR_LEN = 2048;
+// The frame-pipeline architecture keeps per-stage output banks and per-stage
+// weight RAMs in fabric. 16384 was intentionally tried as a stress target, but
+// it over-utilizes the Zynq-7020 LUTRAM/mux fabric by a wide margin. Use 4096
+// as the next practical compile target, then step upward only if utilization
+// has clear headroom.
+localparam int unsigned BNET_PIPE_VECTOR_LEN = 4096;
 
 // Converted ADC samples used inside the FPGA. The raw ADC pins are unsigned
 // "negative slope" format, but most DSP/control logic wants signed values.
@@ -253,6 +260,7 @@ logic [2-1:0]            bnet_input_sel;
 logic                    bnet_static_weight_reuse;
 logic                    bnet_static_pipeline_en;
 logic                    bnet_static_pipeline_active;
+logic                    bnet_single_dac_output_en;
 logic                    bnet_start_pulse;
 logic                    bnet_soft_reset_pulse;
 logic [4-1:0]            bnet_start_stretch;
@@ -269,10 +277,13 @@ logic [32-1:0]           bnet_time_total_cycles;
 logic [32-1:0]           bnet_time_load_cycles;
 logic [32-1:0]           bnet_time_compute_cycles;
 logic [32-1:0]           bnet_time_playback_cycles;
+logic [32-1:0]           bnet_time_input_load_cycles;
+logic [32-1:0]           bnet_time_latency_cycles;
 SBG_T [2-1:0]            bnet_serial_dat;
 logic                    bnet_serial_sample_ready;
 logic                    bnet_serial_weight_ready;
 logic                    bnet_serial_output_valid;
+logic                    bnet_serial_output_ready;
 logic                    bnet_serial_busy;
 logic                    bnet_serial_done;
 logic [32-1:0]           bnet_serial_time_total_cycles;
@@ -284,9 +295,14 @@ logic                    bnet_pipe_sample_ready;
 logic                    bnet_pipe_weight_ready;
 logic                    bnet_pipe_weight_done;
 logic                    bnet_pipe_output_valid;
+logic                    bnet_pipe_output_ready;
 logic                    bnet_pipe_busy;
 logic                    bnet_pipe_done;
 logic [32-1:0]           bnet_pipe_time_output_cycles;
+logic [32-1:0]           bnet_pipe_time_total_cycles;
+logic [32-1:0]           bnet_pipe_time_weight_load_cycles;
+logic [32-1:0]           bnet_pipe_time_input_load_cycles;
+logic [32-1:0]           bnet_pipe_time_latency_cycles;
 logic                    bnet_weight_stream_active;
 logic signed [14-1:0]    bnet_ddr_sample_dat;
 logic signed [14-1:0]    bnet_ddr_weight_dat;
@@ -323,6 +339,9 @@ logic                    dac_axi_rstn;
 logic        [14-1:0] dac_dat_a, dac_dat_b;
 logic        [14-1:0] dac_a    , dac_b    ;
 logic signed [15-1:0] dac_a_sum, dac_b_sum;
+SBG_T [2-1:0] bnet_dac_dat;
+SBG_T         bnet_single_dac_hold;
+logic         bnet_single_dac_hold_valid;
 
 // ASG outputs. ASG means Arbitrary Signal Generator. Software can load waveform
 // samples into memory through SCPI/API, then the ASG streams those samples out
@@ -395,14 +414,20 @@ assign bnet_output_valid = bnet_static_pipeline_active ? bnet_pipe_output_valid 
                                                      bnet_serial_output_valid;
 assign bnet_busy = bnet_static_pipeline_active ? bnet_pipe_busy : bnet_serial_busy;
 assign bnet_done = bnet_static_pipeline_active ? bnet_pipe_done : bnet_serial_done;
-assign bnet_time_total_cycles = bnet_static_pipeline_active ? bnet_pipe_time_output_cycles :
+assign bnet_time_total_cycles = bnet_static_pipeline_active ? bnet_pipe_time_total_cycles :
                                                           bnet_serial_time_total_cycles;
-assign bnet_time_load_cycles = bnet_static_pipeline_active ? 32'd0 :
+assign bnet_time_load_cycles = bnet_static_pipeline_active ? bnet_pipe_time_weight_load_cycles :
                                                          bnet_serial_time_load_cycles;
-assign bnet_time_compute_cycles = bnet_static_pipeline_active ? 32'd0 :
+assign bnet_time_compute_cycles = bnet_static_pipeline_active ? bnet_pipe_time_input_load_cycles :
                                                             bnet_serial_time_compute_cycles;
 assign bnet_time_playback_cycles = bnet_static_pipeline_active ? bnet_pipe_time_output_cycles :
                                                              bnet_serial_time_playback_cycles;
+assign bnet_time_input_load_cycles = bnet_static_pipeline_active ? bnet_pipe_time_input_load_cycles :
+                                                               bnet_serial_time_load_cycles;
+assign bnet_time_latency_cycles = bnet_static_pipeline_active ? bnet_pipe_time_latency_cycles :
+                                                           bnet_serial_time_compute_cycles;
+assign bnet_serial_output_ready = !bnet_single_dac_output_en || !bnet_single_dac_hold_valid;
+assign bnet_pipe_output_ready = !bnet_single_dac_output_en || !bnet_single_dac_hold_valid;
 
 always_ff @(posedge adc_clk) begin
   if (!adc_rstn || bnet_soft_reset_pulse) begin
@@ -805,7 +830,7 @@ butterfly_network #(
   .OUT_DW      (14),
   .WEIGHT_DW   (7),
   .WEIGHT_FRAC (6),
-  .VECTOR_LEN  (2048)
+  .VECTOR_LEN  (BNET_SERIAL_VECTOR_LEN)
 ) i_butterfly_network (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
@@ -821,6 +846,7 @@ butterfly_network #(
   .y0_o     (bnet_serial_dat[0]),
   .y1_o     (bnet_serial_dat[1]),
   .output_valid_o (bnet_serial_output_valid),
+  .output_ready_i (bnet_serial_output_ready),
   .busy_o   (bnet_serial_busy),
   .done_o   (bnet_serial_done),
   .timing_total_cycles_o (bnet_serial_time_total_cycles),
@@ -836,7 +862,7 @@ butterfly_network_static_pipeline #(
   .OUT_DW      (14),
   .WEIGHT_DW   (7),
   .WEIGHT_FRAC (6),
-  .VECTOR_LEN  (2048)
+  .VECTOR_LEN  (BNET_PIPE_VECTOR_LEN)
 ) i_butterfly_static_pipeline (
   .clk_i    (adc_clk),
   .rstn_i   (adc_rstn),
@@ -851,17 +877,50 @@ butterfly_network_static_pipeline #(
   .y0_o (bnet_pipe_dat[0]),
   .y1_o (bnet_pipe_dat[1]),
   .output_valid_o (bnet_pipe_output_valid),
-  .output_ready_i (1'b1),
+  .output_ready_i (bnet_pipe_output_ready),
   .busy_o (bnet_pipe_busy),
   .done_o (bnet_pipe_done),
+  .timing_total_cycles_o (bnet_pipe_time_total_cycles),
+  .timing_weight_load_cycles_o (bnet_pipe_time_weight_load_cycles),
+  .timing_input_load_cycles_o (bnet_pipe_time_input_load_cycles),
+  .timing_latency_cycles_o (bnet_pipe_time_latency_cycles),
   .timing_output_cycles_o (bnet_pipe_time_output_cycles)
 );
+
+// Optional single-DAC output mode. The BNET engines naturally produce two
+// neighboring output samples per clock. CONFIG[6] serializes those two lanes
+// onto DAC A over two clocks and drives DAC B to zero. The output_ready
+// backpressure above prevents the engines from advancing while the saved odd
+// lane sample is being emitted.
+always_ff @(posedge adc_clk) begin
+  if (!adc_rstn || bnet_soft_reset_pulse) begin
+    bnet_dac_dat[0] <= '0;
+    bnet_dac_dat[1] <= '0;
+    bnet_single_dac_hold <= '0;
+    bnet_single_dac_hold_valid <= 1'b0;
+  end else if (bnet_single_dac_output_en) begin
+    if (bnet_single_dac_hold_valid) begin
+      bnet_dac_dat[0] <= bnet_single_dac_hold;
+      bnet_dac_dat[1] <= '0;
+      bnet_single_dac_hold_valid <= 1'b0;
+    end else if (bnet_output_valid) begin
+      bnet_dac_dat[0] <= butterfly_dat[0];
+      bnet_dac_dat[1] <= '0;
+      bnet_single_dac_hold <= butterfly_dat[1];
+      bnet_single_dac_hold_valid <= 1'b1;
+    end
+  end else begin
+    bnet_dac_dat[0] <= butterfly_dat[0];
+    bnet_dac_dat[1] <= butterfly_dat[1];
+    bnet_single_dac_hold_valid <= 1'b0;
+  end
+end
 
 // Sign-extend the 14-bit butterfly outputs to the existing 15-bit saturation
 // stage. Keeping the saturation stage in place preserves the original DAC path
 // structure and makes later experiments easier.
-assign dac_a_sum = {butterfly_dat[0][14-1], butterfly_dat[0]};
-assign dac_b_sum = {butterfly_dat[1][14-1], butterfly_dat[1]};
+assign dac_a_sum = {bnet_dac_dat[0][14-1], bnet_dac_dat[0]};
+assign dac_b_sum = {bnet_dac_dat[1][14-1], bnet_dac_dat[1]};
 
 // Saturation limits overflow to the maximum/minimum 14-bit signed value instead
 // of wrapping around. Wrapping would turn a too-large positive value into a
@@ -1331,6 +1390,7 @@ red_pitaya_daisy  #(
     .input_sel_o    (bnet_input_sel),
     .static_weight_reuse_o (bnet_static_weight_reuse),
     .static_pipeline_en_o (bnet_static_pipeline_en),
+    .single_dac_output_en_o (bnet_single_dac_output_en),
     .start_pulse_o  (bnet_start_pulse),
     .soft_reset_pulse_o (bnet_soft_reset_pulse),
     .compute_busy_i (bnet_busy),
@@ -1340,6 +1400,8 @@ red_pitaya_daisy  #(
     .timing_load_cycles_i (bnet_time_load_cycles),
     .timing_compute_cycles_i (bnet_time_compute_cycles),
     .timing_playback_cycles_i (bnet_time_playback_cycles),
+    .timing_input_load_cycles_i (bnet_time_input_load_cycles),
+    .timing_latency_cycles_i (bnet_time_latency_cycles),
     .stream_base0_o (bnet_stream_base0),
     .stream_base1_o (bnet_stream_base1),
     .stream_length_o(bnet_stream_length),

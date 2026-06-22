@@ -33,10 +33,13 @@
 //                 [3] auto-restart after auto-swap on compute done
 //                 [4] reuse preloaded static butterfly weights
 //                 [5] select fixed-weight frame pipeline
+//                 [6] serialize full BNET vector onto DAC A; DAC B is zero
 //   0x50  TIME_TOTAL RO last start-to-done time in adc_clk cycles
 //   0x54  TIME_LOAD RO last DDR/load time in adc_clk cycles
 //   0x58  TIME_COMPUTE RO last staged compute time in adc_clk cycles
 //   0x5c  TIME_PLAYBACK RO last output playback period in adc_clk cycles
+//   0x60  TIME_INPUT_LOAD RO pipeline input-frame load time in adc_clk cycles
+//   0x64  TIME_LATENCY RO pipeline input-complete to first-output latency
 //
 // Per-stream descriptor window:
 //   stream n base = 0x100 + n * 0x40
@@ -74,6 +77,7 @@ module bnet_regs #(
   output logic [ 2-1:0] input_sel_o,
   output logic          static_weight_reuse_o,
   output logic          static_pipeline_en_o,
+  output logic          single_dac_output_en_o,
   output logic          start_pulse_o,
   output logic          soft_reset_pulse_o,
   input  logic          compute_busy_i,
@@ -83,6 +87,8 @@ module bnet_regs #(
   input  logic [32-1:0] timing_load_cycles_i,
   input  logic [32-1:0] timing_compute_cycles_i,
   input  logic [32-1:0] timing_playback_cycles_i,
+  input  logic [32-1:0] timing_input_load_cycles_i,
+  input  logic [32-1:0] timing_latency_cycles_i,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base0_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base1_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_length_o,
@@ -120,6 +126,8 @@ module bnet_regs #(
   localparam logic [20-1:0] REG_TIME_LOAD    = 20'h00054;
   localparam logic [20-1:0] REG_TIME_COMPUTE = 20'h00058;
   localparam logic [20-1:0] REG_TIME_PLAYBACK = 20'h0005c;
+  localparam logic [20-1:0] REG_TIME_INPUT_LOAD = 20'h00060;
+  localparam logic [20-1:0] REG_TIME_LATENCY = 20'h00064;
 
   localparam logic [20-1:0] STREAM_BASE   = 20'h00100;
   localparam logic [20-1:0] STREAM_STRIDE = 20'h00040;
@@ -191,6 +199,7 @@ module bnet_regs #(
   assign input_sel_o = config_reg[1:0];
   assign static_weight_reuse_o = config_reg[4];
   assign static_pipeline_en_o = config_reg[5];
+  assign single_dac_output_en_o = config_reg[6];
   assign stream_enable_o = stream_enable;
   assign stream_active_buf_o = stream_active_buf;
 
@@ -400,6 +409,8 @@ module bnet_regs #(
         REG_TIME_LOAD:    sys_rdata_o <= timing_load_cycles_i;
         REG_TIME_COMPUTE: sys_rdata_o <= timing_compute_cycles_i;
         REG_TIME_PLAYBACK: sys_rdata_o <= timing_playback_cycles_i;
+        REG_TIME_INPUT_LOAD: sys_rdata_o <= timing_input_load_cycles_i;
+        REG_TIME_LATENCY: sys_rdata_o <= timing_latency_cycles_i;
         default: begin
           if (stream_access) begin
             case (stream_reg_offset)
