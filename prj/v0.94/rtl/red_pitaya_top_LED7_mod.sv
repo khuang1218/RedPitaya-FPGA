@@ -294,6 +294,8 @@ SBG_T [2-1:0]            bnet_pipe_dat;
 logic                    bnet_pipe_sample_ready;
 logic                    bnet_pipe_weight_ready;
 logic                    bnet_pipe_weight_done;
+logic                    bnet_pipe_sample_start_pending;
+logic                    bnet_sample_reader_start;
 logic                    bnet_pipe_output_valid;
 logic                    bnet_pipe_output_ready;
 logic                    bnet_pipe_busy;
@@ -441,6 +443,30 @@ end
 
 assign bnet_start_run = (bnet_input_sel == 2'd2) ? |bnet_start_stretch :
                                                      bnet_start_pulse;
+
+always_ff @(posedge adc_clk) begin
+  if (!adc_rstn || bnet_soft_reset_pulse) begin
+    bnet_pipe_sample_start_pending <= 1'b0;
+    bnet_sample_reader_start <= 1'b0;
+  end else if (!bnet_static_pipeline_active) begin
+    bnet_pipe_sample_start_pending <= 1'b0;
+    bnet_sample_reader_start <= bnet_start_run;
+  end else begin
+    bnet_sample_reader_start <= 1'b0;
+
+    if (bnet_start_run) begin
+      if (bnet_pipe_weight_done) begin
+        bnet_sample_reader_start <= 1'b1;
+        bnet_pipe_sample_start_pending <= 1'b0;
+      end else begin
+        bnet_pipe_sample_start_pending <= 1'b1;
+      end
+    end else if (bnet_pipe_sample_start_pending && bnet_pipe_weight_done) begin
+      bnet_sample_reader_start <= 1'b1;
+      bnet_pipe_sample_start_pending <= 1'b0;
+    end
+  end
+end
 
 generate
 for (genvar BNET_RPTR_IDX = 2; BNET_RPTR_IDX < BNET_STREAM_COUNT; BNET_RPTR_IDX++) begin : bnet_unused_rptr
@@ -747,7 +773,7 @@ bnet_axi_reader_ch #(
   .cfg_clk_i      (adc_clk),
   .cfg_rstn_i     (adc_rstn),
   .soft_reset_i   (bnet_soft_reset_pulse),
-  .start_i        (bnet_start_run && (bnet_input_sel == 2'd2)),
+  .start_i        (bnet_sample_reader_start && (bnet_input_sel == 2'd2)),
   .enable_i       (bnet_stream_enable[0]),
   .active_buf_i   (bnet_stream_active_buf[0]),
   .base0_i        (bnet_stream_base0[0]),

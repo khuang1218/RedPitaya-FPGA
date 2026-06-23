@@ -116,8 +116,9 @@ module butterfly_network_static_pipeline #(
   logic final_output_sample;
 
   assign sample_ready_o = weight_load_done_o && !input_frame_valid[sample_wr_bank];
-  assign busy_o = output_active || (|stage_busy) || (input_frame_valid != 2'b00) ||
-                  (|stage_frame_valid);
+  assign busy_o = total_active || weight_load_active || input_load_active ||
+                  latency_active || output_active || (|stage_busy) ||
+                  (input_frame_valid != 2'b00) || (|stage_frame_valid);
   assign accepted_weight = weight_load_valid_i && weight_load_ready_o;
   assign accepted_sample = sample_valid_i && sample_ready_o;
   assign first_output_sample = output_active && output_ready_i && (output_addr == '0);
