@@ -1,52 +1,31 @@
 # Red Pitaya BNET FPGA Handover
 
-Date: 2026-06-11
+Date: 2026-06-23
 
-Repository:
+Repository root:
 
 ```text
-RedPitaya-FPGA
+RedPitaya-FPGA/
 ```
 
 Target:
 
 ```text
 Project: prj/v0.94
-MODEL: Z20_G2
-Board: Red Pitaya STEMlab 125-14 Zynq-7020 Gen 2
-Recommended Vivado: 2020.1
+Board/model: Red Pitaya STEMlab 125-14 Zynq-7020 Gen 2 / Z20_G2
+Vivado used: 2020.1
+Main edited RTL directory: prj/v0.94/rtl/
 ```
 
-## Current Status
+This handover is written so another ChatGPT/Codex session can review the HDL
+architecture and judge whether it achieves the main purpose: run a DDR-backed
+butterfly-network accelerator on Red Pitaya, compare the original variable
+weight mode against a fixed-weight pipeline mode, and expose enough register/API
+control to test both modes on hardware.
 
-The BNET hardware path is:
+## Quick File Map
 
-```text
-ASG test stream, ADC stream, or DDR stream
-  -> BNET compute block
-  -> DAC output path
-```
-
-Board-proven milestone:
-
-- The fixed `VECTOR_LEN=1024` DDR-backed staged engine has passed board tests.
-- Stream 0 consumed `2048/2048` bytes.
-- Stream 1 consumed `20480/20480` bytes.
-- BNET reported `STATUS=0x12`, `ERROR=0`.
-- RF OUT1 loopback matched the PC-side fixed-point reference with high
-  waveform correlation across ramp/sine/triangle/cosine tests.
-
-Current source status:
-
-- The source now targets `VECTOR_LEN=2048`.
-- Timing counters, guarded ping-pong auto-swap, auto-restart, and static-weight
-  reuse control have been added.
-- A first fixed-weight frame-pipeline RTL draft is wired into the top level
-  behind `CONFIG[5]` for DDR mode.
-- Rebuild in Vivado GUI and board-test before treating the 2048 path or the new
-  pipeline draft as validated.
-
-## Important Files
+Important FPGA files, relative to `RedPitaya-FPGA/`:
 
 ```text
 prj/v0.94/rtl/red_pitaya_top_LED7_mod.sv
@@ -56,181 +35,120 @@ prj/v0.94/rtl/butterfly_network.sv
 prj/v0.94/rtl/butterfly_network_static_pipeline.sv
 ```
 
-The Vivado project flow normally adds the whole `prj/v0.94/rtl` directory, so
-new RTL files there should be picked up by the project/non-project build.
-
-## Architecture
-
-BNET uses Red Pitaya system bus slot `sys[7]`.
-
-The DDR mode takes over the two AXI HP ports that normally support ASG
-deep-memory generation:
+Useful context files:
 
 ```text
-axi2_sys -> BNET stream 0, input samples
-axi3_sys -> BNET stream 1, packed weights
+HANDOVER_bnet_ddr_reader_compile_check.md
+HANDOVER_butterfly_network.md
+vivado.log
 ```
 
-Normal ASG BRAM/table mode remains useful for test stimulus. ASG deep-memory
-AXI is intentionally stubbed in this BNET bitstream so BNET can own `axi2_sys`
-and `axi3_sys`.
-
-Input source selection is controlled by `CONFIG[1:0]`:
+The app/API/SCPI side is in the sibling repository:
 
 ```text
-0 = ASG test stream: sample=ASG A, weight=ASG B
-1 = ADC real-time stream: sample=ADC A, weight=ASG B
-2 = DDR stream: sample=stream 0, weight=stream 1
+../RedPitaya_app/
+../RedPitaya_app/scpi-tests/bnet_pipeline_mode_test.ipynb
 ```
 
-## Module Responsibilities
+## Main Hardware Goal
 
-### `bnet_regs.sv`
+BNET is a custom FPGA butterfly-network data path:
+
+```text
+DDR/ASG/ADC sample source
+  + packed butterfly weights
+  -> BNET compute engine
+  -> DAC output path
+  -> RF OUT1/RF OUT2, optionally RF OUT1 only
+```
+
+There are currently two compute engines:
+
+```text
+butterfly_network.sv
+  Original variable-weight serial staged engine.
+  Loads a full weight stream each run unless static reuse is enabled.
+
+butterfly_network_static_pipeline.sv
+  New fixed-weight frame-pipeline engine.
+  Preloads static weights once, then processes input frames through one worker
+  per butterfly stage.
+```
+
+The intended comparison:
+
+```text
+Variable mode:
+  load samples + load all weights + serial staged compute + playback
+
+Static pipeline cold run:
+  load static weights + load samples + frame-pipeline compute/playback
+
+Static pipeline warm run:
+  reuse static weights + load samples only + frame-pipeline compute/playback
+```
+
+The warm pipeline run is the important final target, because it should move
+toward one vector/frame per stage-pass instead of reloading weights every run.
+
+## Top-Level Architecture
+
+`red_pitaya_top_LED7_mod.sv` is the integration point. It:
+
+- connects the Zynq PS, DDR, ADC, DAC, scope, ASG, PID, GPIO, and daisy blocks;
+- adds the BNET register block at Red Pitaya system bus slot `sys[7]`;
+- gives BNET ownership of AXI HP ports `axi2_sys` and `axi3_sys`;
+- stubs ASG deep-memory AXI while keeping ASG BRAM/table mode usable;
+- selects between serial BNET and static-pipeline BNET;
+- converts signed BNET output samples into the DAC negative-slope format.
+
+Current important top-level constants:
+
+```text
+BNET_STREAM_COUNT      = 8
+BNET_SERIAL_VECTOR_LEN = 2048
+BNET_PIPE_VECTOR_LEN   = 4096
+```
+
+DDR stream ownership:
+
+```text
+axi2_sys -> BNET stream 0 -> input samples
+axi3_sys -> BNET stream 1 -> packed weights
+```
+
+Input source selection is `CONFIG[1:0]` from `bnet_regs.sv`:
+
+```text
+0 = ASG test stream
+    sample = ASG A
+    weight = ASG B
+
+1 = ADC real-time stream
+    sample = ADC A
+    weight = ASG B
+
+2 = DDR stream mode
+    sample = BNET stream 0
+    weight = BNET stream 1
+```
+
+## Register Block: `bnet_regs.sv`
 
 Purpose:
 
-- Owns the BNET register block on `sys[7]`.
-- Exposes scalar/debug registers, stream descriptors, input mode, status,
-  timing counters, and ping-pong controls.
-- Emits one-clock `start_pulse_o` and `soft_reset_pulse_o`.
-- Tracks active/pending stream buffers and descriptor errors.
+- Owns BNET control/status registers on `sys[7]`.
+- Exposes BNET input mode, start/reset pulses, debug LEDs, stream descriptors,
+  stream status, timing counters, and mode bits.
+- Tracks active/pending ping-pong buffers and descriptor errors.
 
-Important `CONFIG` bits:
-
-```text
-bits 1:0 = input mode
-bit 2    = auto-swap to valid pending ping/pong buffers on compute done
-bit 3    = auto-restart after successful auto-swap
-bit 4    = static weight reuse for the current serial engine
-bit 5    = fixed-weight frame pipeline select in DDR mode
-```
-
-Static weight reuse preserves the variable-weight training path. Run once with
-bit 4 clear to load `VECTOR_LEN * log2(VECTOR_LEN)` weights into the current
-serial engine's weight RAM. Then set bit 4 and run with stream 0 only; the
-engine skips stream 1 and reuses the BRAM-resident weights.
-
-### `bnet_axi_reader_ch.sv`
-
-Purpose:
-
-- Reads a ping/pong-selected DDR buffer through `axi_sys_if`.
-- Uses existing `axi_rd_burst`.
-- Uses existing `asg_dat_fifo` to cross from `dac_axi_clk` to `adc_clk`.
-- Splits each 64-bit AXI beat into four 16-bit lanes and emits the low 14 bits
-  of each lane as one signed BNET word.
-- Holds output stable until `consume_i`.
-- Reports read pointer, underrun, and debug status.
-
-Important details:
-
-- Burst requests are limited to 16 AXI beats at a time.
-- `stride_bytes_i` currently only affects read-pointer accounting; it does not
-  skip lanes in hardware.
-- `FORMAT` is stored/exported but not interpreted.
-- Runtime underrun is not sticky.
-
-### `butterfly_network.sv`
-
-Purpose:
-
-- Current active compute engine.
-- Serial full staged radix-2 fixed-point butterfly network.
-- Supports variable weights for training.
-- Loads input samples and full staged weights, computes all stages through
-  ping-pong vector RAMs, then loops final-vector playback to DAC A/B.
-
-Default source shape:
-
-```text
-VECTOR_LEN     = 2048
-STAGE_COUNT    = log2(2048) = 11
-PAIR_COUNT     = 1024 butterflies per stage
-TOTAL_WEIGHTS  = 22528 packed weight words
-```
-
-Input sizes:
-
-```text
-stream 0 = VECTOR_LEN * 2 bytes
-stream 1 = VECTOR_LEN * log2(VECTOR_LEN) * 2 bytes
-```
-
-For the current 2048 source:
-
-```text
-stream 0 = 4096 bytes
-stream 1 = 45056 bytes
-```
-
-Packed weight format:
-
-```text
-weight[13:7] = contribution to first butterfly output
-weight[ 6:0] = contribution to second butterfly output
-```
-
-Weights are signed 7-bit Q1.6. `+1.0` is not exactly representable; use
-`+63/64` for near-identity pass-through and `-64/64` for `-1.0`.
-
-The current serial engine is `N log N` elapsed compute time:
-
-```text
-compute cycles ~= log2(N) * (N / 2) * clocks_per_butterfly
-```
-
-After the BRAM wrapper and serialized multiplier changes, the rough 1024-vector
-estimate is about:
-
-```text
-log2(1024) * 512 * 7 ~= 35840 clocks
-```
-
-### `butterfly_network_static_pipeline.sv`
-
-Purpose:
-
-- First fixed-weight pipeline RTL draft.
-- Separate from the current active variable-weight training engine.
-- Preloads per-stage static weights into BRAM.
-- Gives each butterfly stage its own worker and ping-pong frame buffers.
-- Intended steady-state throughput target is one frame per stage-pass after the
-  pipeline fills, instead of one frame per all-stage serial pass.
-
-Current status:
-
-- Added as RTL and wired into `red_pitaya_top_LED7_mod.sv` behind `CONFIG[5]`.
-- Needs Vivado GUI elaboration/synthesis review.
-- Top-level mux selects its stream ready signals, DAC output, busy/done status,
-  and timing output when `CONFIG[5]` is set and `CONFIG[1:0] == 2`.
-- This is a frame pipeline, not yet the final sample-by-sample SDF pipeline.
-
-### `red_pitaya_top_LED7_mod.sv`
-
-Purpose:
-
-- Connects BNET register block, DDR readers, input mux, compute engine, and DAC
-  path.
-- Stubs ASG deep-memory AXI through dummy interfaces while preserving ASG
-  BRAM/table mode.
-- Drives DAC A/B from `butterfly_dat[0]` and `butterfly_dat[1]`.
-
-Current active compute output:
-
-```text
-butterfly_network.sv -> butterfly_dat[0] -> DAC A / RF OUT1
-butterfly_network.sv -> butterfly_dat[1] -> DAC B / RF OUT2
-```
-
-## Register Summary
-
-Offsets are relative to BNET base `0x00700000`.
+Important register offsets relative to the BNET base:
 
 ```text
 0x00 CONTROL
 0x04 STATUS
 0x08..0x24 CH0..CH7 scalar/debug registers
-0x28..0x34 OUT0..OUT3 scalar/debug outputs
+0x28..0x34 OUT0..OUT3 simple scalar outputs
 0x38 VECTOR_LEN
 0x3c STREAM_COUNT
 0x40 ACTIVE_MASK
@@ -241,7 +159,30 @@ Offsets are relative to BNET base `0x00700000`.
 0x54 TIME_LOAD
 0x58 TIME_COMPUTE
 0x5c TIME_PLAYBACK
+0x60 TIME_INPUT_LOAD
+0x64 TIME_LATENCY
 0x100 + n*0x40 stream descriptor window
+```
+
+Important `CONFIG` bits:
+
+```text
+bits 1:0 = input source mode
+bit 2    = auto-swap pending stream buffers on compute done
+bit 3    = auto-restart after auto-swap
+bit 4    = serial-engine static weight reuse
+bit 5    = select fixed-weight frame pipeline in DDR mode
+bit 6    = serialize the full BNET vector onto DAC A / RF OUT1 only
+```
+
+Useful `CONFIG` values:
+
+```text
+2  = DDR one-shot, serial variable-weight engine
+18 = DDR one-shot, serial engine with reused static weights
+34 = DDR one-shot, static frame-pipeline engine
+66 = DDR one-shot, serial engine, single-DAC serialized output
+98 = DDR one-shot, static pipeline, single-DAC serialized output
 ```
 
 `STATUS` bits currently used:
@@ -250,7 +191,7 @@ Offsets are relative to BNET base `0x00700000`.
 bit 0 = busy
 bit 1 = done, sticky until next START/reset
 bit 3 = any stream pending
-bit 4 = output playback valid
+bit 4 = output_valid pulse mirror
 ```
 
 Per-stream descriptor window:
@@ -278,139 +219,353 @@ bit 3 = force swap
 bit 4 = clear descriptor/runtime error
 ```
 
-## DDR Test Flow
+## DDR Reader: `bnet_axi_reader_ch.sv`
 
-For current variable-weight DDR mode:
+Purpose:
 
-```text
-1. Reserve/upload stream 0 input vector.
-2. Reserve/upload stream 1 full staged weight vector.
-3. Attach stream 0 and stream 1 descriptors.
-4. Enable both streams.
-5. Commit selected ping/pong buffers.
-6. Set CONFIG = 2 for DDR one-shot.
-7. Write CONTROL[0] start.
-8. Poll STATUS, ERROR, stream STATUS, READ_PTR, and timing counters.
-```
+- Reads one ping/pong-selected DDR buffer through `axi_sys_if`.
+- Uses `axi_rd_burst` for AXI reads.
+- Crosses from AXI/DAC clock domain to ADC/BNET clock domain with
+  `asg_dat_fifo`.
+- Splits each 64-bit AXI beat into four 16-bit lanes.
+- Emits one signed 14-bit BNET word per consumed lane.
 
-Useful CONFIG values:
+Important behavior:
 
 ```text
-2  = DDR one-shot
-6  = DDR + auto-swap
-14 = DDR + auto-swap + auto-restart
-18 = DDR one-shot + static weight reuse in the current serial engine
-34 = DDR one-shot + fixed-weight frame pipeline
+valid_o     = current 16-bit lane is available
+sample_o    = low SAMPLE_DW bits of current lane
+consume_i   = downstream accepts this lane
+read_ptr_o  = increments by stride_bytes_i on consume_i
+debug0_o    = packed internal status flags
+debug1_o    = AXI bytes requested
 ```
 
-Expected read pointers for 2048 source:
+Important limitation:
+
+- `stride_bytes_i` currently affects pointer accounting only. It does not skip
+  lanes in hardware.
+- `FORMAT` is stored but not interpreted.
+- Runtime underrun is exposed but not very rich; starvation diagnostics could be
+  improved.
+
+## Serial Engine: `butterfly_network.sv`
+
+Purpose:
+
+- Original active BNET compute engine.
+- Full staged radix-2 butterfly network.
+- Supports changing weights every run, which is needed for training-style
+  experiments.
+- Can reuse already-loaded weights if `CONFIG[4]` is set.
+
+Compiled size:
 
 ```text
-stream0 READ_PTR -> 4096
-stream1 READ_PTR -> 45056
+VECTOR_LEN     = BNET_SERIAL_VECTOR_LEN = 2048
+STAGE_COUNT    = log2(2048) = 11
+PAIR_COUNT     = 1024 butterflies per stage
+TOTAL_WEIGHTS  = 2048 * 11 = 22528 packed weight words
 ```
 
-For `CONFIG=18`, stream 1 is intentionally skipped after weights have already
-been loaded by a previous run.
+Expected DDR bytes:
 
-For `CONFIG=34`, the fixed-weight pipeline consumes stream 1 until its static
-weight preload is complete, then consumes stream 0 input frames. The sample
-reader may start on the same `CONTROL[0]` pulse, but the pipeline keeps
-`sample_ready_o` low until weight preload completes.
+```text
+stream 0 samples = 2048 * 2      = 4096 bytes
+stream 1 weights = 2048 * 11 * 2 = 45056 bytes
+```
 
-## Bugs To Avoid
+Packed weight format:
 
-### 1. Soft Reset Must Reset Readers And Compute FSM
+```text
+weight[13:7] = sample contribution to y0
+weight[ 6:0] = sample contribution to y1
+```
 
-Original symptom:
+Weights are signed 7-bit Q1.6:
+
+```text
++1.0 is not exactly representable; use +63/64
+-1.0 is representable as -64/64
+```
+
+Internal structure:
+
+- load input vector into local RAM;
+- load staged weight stream into local weight RAM unless reuse is enabled;
+- run all butterfly stages serially;
+- use ping-pong vector RAMs between stages;
+- play final vector back two samples per clock as `y0_o` and `y1_o`.
+
+Timing counters:
+
+```text
+TIME0/TOTAL    start/load through compute/playback accounting
+TIME1/LOAD     input + weight load cycles
+TIME2/COMPUTE  staged compute cycles
+TIME3/PLAYBACK final vector playback cycles
+```
+
+## Static Pipeline Engine: `butterfly_network_static_pipeline.sv`
+
+Purpose:
+
+- Fixed-weight frame-pipelined BNET path.
+- Separate from the serial variable-weight engine.
+- Preloads static weights once into per-stage RAMs.
+- Moves complete input frames through one hardware worker per butterfly stage.
+
+Compiled size:
+
+```text
+VECTOR_LEN     = BNET_PIPE_VECTOR_LEN = 4096
+STAGE_COUNT    = log2(4096) = 12
+TOTAL_WEIGHTS  = 4096 * 12 = 49152 packed weight words
+```
+
+Expected DDR bytes:
+
+```text
+stream 0 samples = 4096 * 2      = 8192 bytes
+stream 1 weights = 4096 * 12 * 2 = 98304 bytes
+```
+
+Internal structure:
+
+- top-level static pipeline controller;
+- two input frame banks;
+- `STAGE_COUNT` generated `butterfly_static_frame_stage` workers;
+- each stage owns:
+  - one per-stage weight RAM,
+  - two output frame banks,
+  - a small FSM that reads one pair, multiplies/accumulates/scales, then writes
+    the pair result;
+- final output reads the last stage frame banks two samples per output cycle.
+
+Important timing counters:
+
+```text
+TIME0/TOTAL       full cold/warm run cycle count
+TIME1/LOAD        static weight preload cycles
+TIME2/COMPUTE     top-level aliases this to input-load cycles in pipeline mode
+TIME3/PLAYBACK    final output cycles
+TIME4/INPUT_LOAD  raw input-frame load cycles
+TIME5/LATENCY     input-frame complete to first output-valid
+```
+
+Important recent fixes:
+
+- `busy_o` now includes weight load, input load, latency, stage activity, and
+  output playback. Earlier versions only reported busy once internal stages or
+  output playback were active, making `STATUS` misleading during preload.
+- `red_pitaya_top_LED7_mod.sv` now has a stateful cold-run handoff:
+
+```text
+on BNET start:
+  if pipeline weights are already loaded:
+    pulse sample DDR reader immediately
+  else:
+    set sample_start_pending
+
+when weight preload finishes:
+  if sample_start_pending:
+    pulse sample DDR reader
+    clear sample_start_pending
+```
+
+This was added because the first edge-only handoff still left cold pipeline
+runs stuck after stream 1 reached `98304` bytes while stream 0 stayed at `0`.
+
+## Top-Level Mode Selection And DAC Path
+
+`red_pitaya_top_LED7_mod.sv` selects active engine outputs:
+
+```text
+if CONFIG[5] && CONFIG[1:0] == 2:
+  use butterfly_network_static_pipeline
+else:
+  use butterfly_network
+```
+
+Selected signals include:
+
+```text
+sample_ready
+weight_ready
+butterfly_dat[0:1]
+output_valid
+busy
+done
+timing counters
+```
+
+Normal two-DAC output:
+
+```text
+butterfly_dat[0] -> DAC A -> RF OUT1
+butterfly_dat[1] -> DAC B -> RF OUT2
+```
+
+Single-DAC mode, `CONFIG[6]`:
+
+```text
+cycle 0: DAC A gets y0, DAC B gets 0, y1 is held
+cycle 1: DAC A gets held y1, DAC B gets 0
+```
+
+This reconstructs the full vector on RF OUT1 over twice as many DAC cycles.
+Backpressure (`output_ready_i`) prevents the compute engine from dropping the
+second lane while the held sample is emitted.
+
+## Hardware Dataflow Summary
+
+Serial DDR mode, `CONFIG=2`:
+
+```text
+BNET:START
+  -> start stream 0 reader
+  -> start stream 1 reader
+  -> serial engine accepts samples and weights
+  -> compute all stages serially
+  -> output final vector two samples per clock
+```
+
+Serial weight-reuse mode, `CONFIG=18`:
+
+```text
+first run with CONFIG=2 loads weights
+next run with CONFIG=18:
+  -> start stream 0 reader only
+  -> reuse serial engine weight RAM
+```
+
+Static pipeline cold mode, `CONFIG=34`:
+
+```text
+BNET:START
+  -> start stream 1 reader
+  -> preload all static stage weights
+  -> start stream 0 reader after weight_load_done
+  -> load one 4096-sample input frame
+  -> push frame through per-stage workers
+  -> output final vector
+```
+
+Static pipeline warm mode, `CONFIG=34` with weights already loaded:
+
+```text
+BNET:START
+  -> skip stream 1
+  -> start stream 0 reader immediately
+  -> run next input frame with reused static weights
+```
+
+## Board-Test Expectations
+
+Serial 2048 mode:
+
+```text
+CONFIG?            -> 2
+STREAM0:RPTR?      -> 4096
+STREAM1:RPTR?      -> 45056
+STATUS? done bit   -> set
+ERROR?             -> 0
+TIME1/TIME2/TIME3  -> nonzero
+```
+
+Pipeline 4096 cold mode:
+
+```text
+CONFIG?            -> 34
+STREAM1:RPTR?      -> 98304
+STREAM0:RPTR?      -> 8192
+STATUS? done bit   -> set eventually
+ERROR?             -> 0
+TIME1              -> nonzero weight preload cycles
+TIME4              -> nonzero input-load cycles
+TIME5              -> nonzero latency cycles
+TIME3              -> about VECTOR_LEN/2 for two-DAC output
+```
+
+Pipeline 4096 warm mode:
+
+```text
+STREAM1:RPTR?      -> should not advance/reload weights
+STREAM0:RPTR?      -> 8192 each run
+TIME1              -> should remain zero or unchanged for warm input-only runs
+TIME4/TIME5/TIME3  -> finite and stable across repeated runs
+```
+
+RF loopback expectations:
+
+- In normal two-DAC mode, RF OUT1 carries even-indexed output samples and RF
+  OUT2 carries odd-indexed output samples.
+- To compare the full BNET result, connect both RF outputs to both inputs and
+  interleave captured channels.
+- In single-DAC mode, RF OUT1 should carry the full vector in order, but over
+  twice as many DAC cycles.
+
+## Bugs And Pitfalls To Avoid
+
+### Soft reset must reset readers and compute state
+
+Symptom:
 
 ```text
 BNET:RST
-BNET:STREAM0:RPTR? -> nonzero
-BNET:STREAM1:RPTR? -> nonzero
+BNET:STREAM0:RPTR? -> stale nonzero
+BNET:STREAM1:RPTR? -> stale nonzero
 ```
 
-Root cause:
-
-- `bnet_regs.sv` handled soft reset internally but did not export it.
-- DDR readers and `butterfly_network.sv` kept stale runtime state.
-
-Fix to preserve:
+Preserve:
 
 - `bnet_regs.sv` exports `soft_reset_pulse_o`.
-- `red_pitaya_top_LED7_mod.sv` wires it to both DDR readers and the compute
-  engine.
-- `bnet_axi_reader_ch.sv` resets visible read pointer/output state and AXI-side
-  FSM/FIFO state.
-- `butterfly_network.sv` includes `soft_reset_i` in its FSM reset condition.
+- Top level wires it into both DDR readers and both BNET engines.
+- Reader FIFOs/FSMs and compute FSMs include this reset.
 
-### 2. Do Not Issue Overlapping AXI Bursts From Delayed `ctrl_busy_o`
+### Do not issue overlapping AXI bursts
 
-Original symptom:
+Symptom:
 
 ```text
-STATUS busy forever
-stream0_rptr stopped early
-stream1_rptr stopped early
+busy forever
+read pointers stop early
+bytes_requested_axi runs ahead
 ```
 
-Root cause:
+Preserve in `bnet_axi_reader_ch.sv`:
 
-- `axi_rd_burst.ctrl_busy_o` is registered/delayed.
-- The reader could issue another `ctrl_val` before the previous burst was
-  visibly busy.
-- `bytes_requested_axi` could run ahead of actual delivered data.
+- `ctrl_req_inflight_axi`
+- `ctrl_busy_seen_axi`
+- issue one burst, wait until busy is observed, then wait until idle.
 
-Fix to preserve:
+### Do not drop AXI read beats at the FIFO boundary
 
-- Keep `ctrl_req_inflight_axi` and `ctrl_busy_seen_axi`.
-- Issue one burst, wait until busy is observed, wait until idle, then allow the
-  next burst.
-
-### 3. Do Not Drop AXI Read Beats At FIFO Boundary
-
-Original symptom:
-
-- Stream 0 completed but longer stream 1 stopped early, for example
-  `14032/20480` bytes.
-
-Root cause:
-
-- AXI read data was connected too directly to the async FIFO write side.
-- A valid beat could arrive while FIFO write side was reset-busy/full.
-
-Fix to preserve:
-
-- Keep the AXI-clock skid buffer between `axi_rd_burst` and `asg_dat_fifo`.
-- Drive AXI `rd_drdy_i` from skid-buffer capacity.
-- Drain skid buffer into FIFO only when FIFO write side is ready.
-- Do not request the next burst until the skid buffer has drained.
-
-### 4. RF OUT1 Is The Even-Indexed Final Vector Half
-
-`butterfly_network.sv` playback emits two final-vector samples per clock:
+Symptom:
 
 ```text
-DAC A / RF OUT1 = expected[0], expected[2], expected[4], ...
-DAC B / RF OUT2 = expected[1], expected[3], expected[5], ...
+short streams pass
+long stream 1 stops early
 ```
 
-RF OUT1 validation must compare against `expected[0::2]`, not the full PC
-reference vector.
+Preserve:
 
-### 5. BRAM Inference Is Critical
+- AXI-clock skid buffer before `asg_dat_fifo`.
+- Do not request next burst until skid buffer has drained.
+- Keep FIFO reset/start handling synchronized.
 
-Vivado previously over-used LUT resources when large memories were not inferred
-as BRAM.
+### BRAM inference is critical
 
-Fixes already applied:
+Large vector and weight memories must infer block RAM. Earlier versions used too
+many LUTRAM/F7 mux resources, especially when attempting 16384 pipeline length.
 
-- Added BRAM style hints.
-- Replaced raw arrays with explicit `bnet_tdp_ram`.
-- Updated `bnet_tdp_ram` to use one clocked write process per RAM port, because
-  Vivado 2020.1 did not infer RAM from two write ports in one process.
+Current practical compile target:
 
-Template to preserve:
+```text
+BNET_PIPE_VECTOR_LEN = 4096
+```
+
+Preserve `bnet_tdp_ram` style:
 
 ```systemverilog
 always_ff @(posedge clk_i) begin
@@ -424,77 +579,100 @@ always_ff @(posedge clk_i) begin
 end
 ```
 
-Check synthesis reports to confirm vector RAMs and weight RAMs infer as block
-RAM, not LUT/register fabric.
+Review Vivado utilization reports for BRAM/LUTRAM mapping.
 
-## Diagnostics Still Needed
+### Pipeline cold-run handoff is delicate
 
-Useful future counters/status:
-
-```text
-bytes_requested_axi
-delivered AXI beat count
-consumed sample/word count
-running_axi
-ctrl_req_inflight_axi
-ctrl_busy
-FIFO empty/full/reset-busy flags
-butterfly load state
-sample_wr_addr
-weight_wr_addr
-samples_loaded
-weights_loaded
-stream starvation/backpressure cycles
-```
-
-Current underrun reporting is weak because top-level `consume_i` is gated by
-reader `valid_o`. A real starvation flag should detect:
+Known bad signature from an earlier build:
 
 ```text
-DDR mode && compute_ready && !reader_valid
+STATUS?        -> 1
+STREAM1:RPTR?  -> 98304
+TIME1?         -> nonzero
+STREAM0:RPTR?  -> 0
+TIME4?         -> 0
 ```
 
-## Validation Checklist
+Meaning:
 
-Before board testing:
+- static weights loaded;
+- sample DDR reader never started;
+- pipeline stuck waiting for the input frame.
 
-- Confirm Vivado sees the updated `butterfly_network.sv` ports.
-- Confirm Vivado sees `butterfly_network_static_pipeline.sv`.
-- Confirm `CONFIG=34` selects the fixed-weight pipeline in DDR mode.
-- Confirm only BNET drives `axi2_sys` and `axi3_sys`; ASG deep-memory AXI must
-  remain on dummy interfaces.
-- Confirm `asg_dat_fifo` remains 96-bit wide.
-- Confirm `bnet_tdp_ram` infers BRAM.
-- Check LUT/DSP/BRAM utilization and timing at `VECTOR_LEN=2048`.
+The current HDL tries to fix this with `bnet_pipe_sample_start_pending` in
+`red_pitaya_top_LED7_mod.sv`. Review this logic carefully.
 
-Board tests:
+### Weight stream sizes must match engine size
 
-- `BNET:RST` clears stream read pointers.
-- DDR smoke test reaches expected `READ_PTR` values.
-- `STATUS[1]` eventually sets.
-- `ERROR_MASK` remains zero.
-- Timing counters are nonzero after done.
-- RF OUT1 compares against `expected[0::2]`.
-- Multi-input stability still passes.
-- Static-weight reuse mode: load weights once with `CONFIG=2`, then run a new
-  input vector with `CONFIG=18` and verify stream 1 is not consumed.
-- Static pipeline mode: use `CONFIG=34`, verify stream 1 reaches the full
-  static-weight length, then stream 0 frames are consumed and RF output appears.
-
-## Next Hardware Steps
-
-1. Vivado GUI elaboration/synthesis for the current source.
-2. Validate the existing serial engine at `VECTOR_LEN=2048`.
-3. Review and synthesize `butterfly_network_static_pipeline.sv` and its
-   top-level integration.
-4. Board-test the CONFIG-selected paths:
+For serial 2048 mode:
 
 ```text
-CONFIG=2  current variable-weight serial engine
-CONFIG=18 current serial engine with weight reuse
-CONFIG=34 new fixed-weight frame pipeline
+weights = 2048 * 11 packed words = 45056 bytes
 ```
 
-5. Add richer static-pipeline timing counters and debug/status.
-6. If frame-pipeline synthesis is acceptable, move toward a true sample
-   streaming/SDF pipeline for lower first-frame latency.
+For pipeline 4096 mode:
+
+```text
+weights = 4096 * 12 packed words = 98304 bytes
+```
+
+Uploading the wrong weight size can leave a reader or engine waiting forever.
+
+## Suggested Review Questions For ChatGPT
+
+When asking another model to review the HDL, give it this file and these files:
+
+```text
+prj/v0.94/rtl/red_pitaya_top_LED7_mod.sv
+prj/v0.94/rtl/bnet_regs.sv
+prj/v0.94/rtl/bnet_axi_reader_ch.sv
+prj/v0.94/rtl/butterfly_network.sv
+prj/v0.94/rtl/butterfly_network_static_pipeline.sv
+```
+
+Ask it to check:
+
+1. Does the top-level mode mux correctly isolate serial and pipeline engines?
+2. Does DDR stream 0 start correctly for serial, pipeline cold, and pipeline
+   warm runs?
+3. Does DDR stream 1 correctly skip weight reload when weights are reusable?
+4. Can `bnet_pipe_sample_start_pending` miss or duplicate a sample-reader start?
+5. Can `STATUS[0]`, `STATUS[1]`, and timing counters get stuck or misreport?
+6. Are there any combinational loops or multiple drivers in the ready/valid
+   handshakes?
+7. Are reset paths complete for soft reset and PS reset?
+8. Are BRAMs inferred for all large vector/weight memories?
+9. Does single-DAC serialization preserve sample order and apply backpressure?
+10. Are the 2048 serial and 4096 pipeline byte counts consistent from software
+    through RTL?
+
+## Current Next Steps
+
+1. Recompile the latest HDL after the stateful pipeline cold-start fix.
+2. Upload the bitstream to the board.
+3. Rerun `../RedPitaya_app/scpi-tests/bnet_pipeline_mode_test.ipynb`.
+4. First check the cold pipeline diagnostics:
+
+```text
+BNET:STATUS?
+BNET:ERROR?
+BNET:STREAM0:RPTR?
+BNET:STREAM1:RPTR?
+BNET:TIME0?
+BNET:TIME1?
+BNET:TIME2?
+BNET:TIME3?
+BNET:TIME4?
+BNET:TIME5?
+```
+
+5. If cold pipeline completes, run repeated warm 4096-frame tests.
+6. If warm tests are stable, compare cycle counters for:
+
+```text
+serial variable-weight mode
+serial static-weight reuse mode
+pipeline cold mode
+pipeline warm mode
+```
+
