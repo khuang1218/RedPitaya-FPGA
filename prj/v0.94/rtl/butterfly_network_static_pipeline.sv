@@ -413,14 +413,10 @@ module butterfly_static_frame_stage #(
 
   localparam logic [PAIR_W-1:0] LAST_PAIR = PAIR_COUNT - 1;
 
-  typedef enum logic [2:0] {
+  typedef enum logic [1:0] {
     ST_IDLE,
-    ST_READ,
-    ST_LATCH,
-    ST_MUL_Y0,
-    ST_MUL_Y1,
-    ST_SCALE,
-    ST_WRITE
+    ST_RUN,
+    ST_DRAIN
   } state_t;
 
   state_t state;
@@ -440,6 +436,22 @@ module butterfly_static_frame_stage #(
   logic signed [ACC_DW-1:0] acc_y1;
   logic signed [OUT_DW-1:0] result_y0;
   logic signed [OUT_DW-1:0] result_y1;
+  logic s0_valid;
+  logic s1_valid;
+  logic s2_valid;
+  logic s3_valid;
+  logic s0_last;
+  logic s1_last;
+  logic s2_last;
+  logic s3_last;
+  logic [ADDR_W-1:0] s0_addr_a;
+  logic [ADDR_W-1:0] s0_addr_b;
+  logic [ADDR_W-1:0] s1_addr_a;
+  logic [ADDR_W-1:0] s1_addr_b;
+  logic [ADDR_W-1:0] s2_addr_a;
+  logic [ADDR_W-1:0] s2_addr_b;
+  logic [ADDR_W-1:0] s3_addr_a;
+  logic [ADDR_W-1:0] s3_addr_b;
 
   logic [ADDR_W-1:0] out_addr_a;
   logic [ADDR_W-1:0] out_addr_b;
@@ -526,9 +538,9 @@ module butterfly_static_frame_stage #(
     out_we_a = 1'b0;
     out_we_b = 1'b0;
 
-    if (state == ST_WRITE) begin
-      out_addr_a = addr_a;
-      out_addr_b = addr_b;
+    if (s3_valid) begin
+      out_addr_a = s3_addr_a;
+      out_addr_b = s3_addr_b;
       out_din_a = result_y0;
       out_din_b = result_y1;
       out_we_a = 1'b1;
@@ -561,11 +573,11 @@ module butterfly_static_frame_stage #(
     .AW    (ADDR_W)
   ) i_out_bank0 (
     .clk_i    (clk_i),
-    .addr_a_i ((out_bank == 1'b0 && state == ST_WRITE) ? out_addr_a : out_rd_addr_a_i),
+    .addr_a_i ((out_bank == 1'b0 && s3_valid) ? out_addr_a : out_rd_addr_a_i),
     .din_a_i  (out_din_a),
     .we_a_i   ((out_bank == 1'b0) && out_we_a),
     .dout_a_o (out_bank0_dout_a),
-    .addr_b_i ((out_bank == 1'b0 && state == ST_WRITE) ? out_addr_b : out_rd_addr_b_i),
+    .addr_b_i ((out_bank == 1'b0 && s3_valid) ? out_addr_b : out_rd_addr_b_i),
     .din_b_i  (out_din_b),
     .we_b_i   ((out_bank == 1'b0) && out_we_b),
     .dout_b_o (out_bank0_dout_b)
@@ -577,17 +589,17 @@ module butterfly_static_frame_stage #(
     .AW    (ADDR_W)
   ) i_out_bank1 (
     .clk_i    (clk_i),
-    .addr_a_i ((out_bank == 1'b1 && state == ST_WRITE) ? out_addr_a : out_rd_addr_a_i),
+    .addr_a_i ((out_bank == 1'b1 && s3_valid) ? out_addr_a : out_rd_addr_a_i),
     .din_a_i  (out_din_a),
     .we_a_i   ((out_bank == 1'b1) && out_we_a),
     .dout_a_o (out_bank1_dout_a),
-    .addr_b_i ((out_bank == 1'b1 && state == ST_WRITE) ? out_addr_b : out_rd_addr_b_i),
+    .addr_b_i ((out_bank == 1'b1 && s3_valid) ? out_addr_b : out_rd_addr_b_i),
     .din_b_i  (out_din_b),
     .we_b_i   ((out_bank == 1'b1) && out_we_b),
     .dout_b_o (out_bank1_dout_b)
   );
 
-  assign busy_o = (state != ST_IDLE);
+  assign busy_o = (state != ST_IDLE) || s0_valid || s1_valid || s2_valid || s3_valid;
 
   always_ff @(posedge clk_i) begin
     if (!rstn_i || soft_reset_i) begin
@@ -602,56 +614,83 @@ module butterfly_static_frame_stage #(
       acc_y1 <= '0;
       result_y0 <= '0;
       result_y1 <= '0;
+      s0_valid <= 1'b0;
+      s1_valid <= 1'b0;
+      s2_valid <= 1'b0;
+      s3_valid <= 1'b0;
+      s0_last <= 1'b0;
+      s1_last <= 1'b0;
+      s2_last <= 1'b0;
+      s3_last <= 1'b0;
+      s0_addr_a <= '0;
+      s0_addr_b <= '0;
+      s1_addr_a <= '0;
+      s1_addr_b <= '0;
+      s2_addr_a <= '0;
+      s2_addr_b <= '0;
+      s3_addr_a <= '0;
+      s3_addr_b <= '0;
       done_o <= 1'b0;
     end else begin
       done_o <= 1'b0;
+
+      s0_valid <= (state == ST_RUN);
+      s1_valid <= s0_valid;
+      s2_valid <= s1_valid;
+      s3_valid <= s2_valid;
+      s0_last <= (state == ST_RUN) && (pair_idx == LAST_PAIR);
+      s1_last <= s0_last;
+      s2_last <= s1_last;
+      s3_last <= s2_last;
+      s0_addr_a <= addr_a;
+      s0_addr_b <= addr_b;
+      s1_addr_a <= s0_addr_a;
+      s1_addr_b <= s0_addr_b;
+      s2_addr_a <= s1_addr_a;
+      s2_addr_b <= s1_addr_b;
+      s3_addr_a <= s2_addr_a;
+      s3_addr_b <= s2_addr_b;
+
+      if (s0_valid) begin
+        sample_a <= src_data_a_i;
+        sample_b <= src_data_b_i;
+        weight_a <= weight_dout_a;
+        weight_b <= weight_dout_b;
+      end
+
+      if (s1_valid) begin
+        acc_y0 <= $signed(mul_sample_weight(sample_a, weight_a[2*WEIGHT_DW-1:WEIGHT_DW])) +
+                  $signed(mul_sample_weight(sample_b, weight_b[2*WEIGHT_DW-1:WEIGHT_DW]));
+        acc_y1 <= $signed(mul_sample_weight(sample_a, weight_a[WEIGHT_DW-1:0])) +
+                  $signed(mul_sample_weight(sample_b, weight_b[WEIGHT_DW-1:0]));
+      end
+
+      if (s2_valid) begin
+        result_y0 <= sat_to_out(round_shift(acc_y0));
+        result_y1 <= sat_to_out(round_shift(acc_y1));
+      end
 
       unique case (state)
         ST_IDLE: begin
           if (start_i) begin
             pair_idx <= '0;
             out_bank <= out_bank_i;
-            state <= ST_READ;
+            state <= ST_RUN;
           end
         end
 
-        ST_READ: begin
-          state <= ST_LATCH;
-        end
-
-        ST_LATCH: begin
-          sample_a <= src_data_a_i;
-          sample_b <= src_data_b_i;
-          weight_a <= weight_dout_a;
-          weight_b <= weight_dout_b;
-          state <= ST_MUL_Y0;
-        end
-
-        ST_MUL_Y0: begin
-          acc_y0 <= $signed(mul_sample_weight(sample_a, weight_a[2*WEIGHT_DW-1:WEIGHT_DW])) +
-                    $signed(mul_sample_weight(sample_b, weight_b[2*WEIGHT_DW-1:WEIGHT_DW]));
-          state <= ST_MUL_Y1;
-        end
-
-        ST_MUL_Y1: begin
-          acc_y1 <= $signed(mul_sample_weight(sample_a, weight_a[WEIGHT_DW-1:0])) +
-                    $signed(mul_sample_weight(sample_b, weight_b[WEIGHT_DW-1:0]));
-          state <= ST_SCALE;
-        end
-
-        ST_SCALE: begin
-          result_y0 <= sat_to_out(round_shift(acc_y0));
-          result_y1 <= sat_to_out(round_shift(acc_y1));
-          state <= ST_WRITE;
-        end
-
-        ST_WRITE: begin
+        ST_RUN: begin
           if (pair_idx == LAST_PAIR) begin
-            done_o <= 1'b1;
-            state <= ST_IDLE;
+            state <= ST_DRAIN;
           end else begin
             pair_idx <= pair_idx + 1'b1;
-            state <= ST_READ;
+          end
+        end
+
+        ST_DRAIN: begin
+          if (s3_valid && s3_last) begin
+            done_o <= 1'b1;
+            state <= ST_IDLE;
           end
         end
 

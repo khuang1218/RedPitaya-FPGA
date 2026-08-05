@@ -52,6 +52,13 @@
  * send and received is at the moment undefined. This is left for the user.
  */
 
+// Build-time BNET engine selection.
+//
+// Define BNET_ENABLE_SDF to replace the fixed-weight frame pipeline with the
+// experimental static-weight SDF streaming engine. Comment this line out to use
+// the proven frame-pipeline implementation instead.
+`define BNET_ENABLE_SDF
+
 module red_pitaya_top #(
   // Parameters are compile-time constants. They let the same source file be
   // built for slightly different Red Pitaya boards without changing the logic
@@ -245,6 +252,7 @@ localparam int unsigned BNET_PIPE_VECTOR_LEN = 4096;
 // Converted ADC samples used inside the FPGA. The raw ADC pins are unsigned
 // "negative slope" format, but most DSP/control logic wants signed values.
 SBA_T [MNA-1:0]          adc_dat;
+SBA_T [MNA-1:0]          scope_adc_dat;
 
 // Butterfly-network output. The module treats ASG channel A as the input vector
 // stream and ASG channel B as a packed weight stream. For each input sample,
@@ -261,6 +269,11 @@ logic                    bnet_static_weight_reuse;
 logic                    bnet_static_pipeline_en;
 logic                    bnet_static_pipeline_active;
 logic                    bnet_single_dac_output_en;
+logic                    bnet_split_dac_output_en;
+logic                    bnet_combine_adc_input_en;
+logic                    bnet_combine_adc_phase;
+logic [32-1:0]           bnet_vector_len;
+logic [2-1:0]            bnet_weight_bank;
 logic                    bnet_start_pulse;
 logic                    bnet_soft_reset_pulse;
 logic [4-1:0]            bnet_start_stretch;
@@ -271,8 +284,11 @@ logic                    bnet_weight_valid;
 logic                    bnet_sample_ready;
 logic                    bnet_weight_ready;
 logic                    bnet_output_valid;
+logic                    bnet_engine_busy;
+logic                    bnet_engine_done;
 logic                    bnet_busy;
 logic                    bnet_done;
+logic                    bnet_done_pending;
 logic [32-1:0]           bnet_time_total_cycles;
 logic [32-1:0]           bnet_time_load_cycles;
 logic [32-1:0]           bnet_time_compute_cycles;
@@ -342,8 +358,29 @@ logic        [14-1:0] dac_dat_a, dac_dat_b;
 logic        [14-1:0] dac_a    , dac_b    ;
 logic signed [15-1:0] dac_a_sum, dac_b_sum;
 SBG_T [2-1:0] bnet_dac_dat;
-SBG_T         bnet_single_dac_hold;
-logic         bnet_single_dac_hold_valid;
+SBG_T [2-1:0] bnet_dac_pair_hold;
+logic [4-1:0] bnet_dac_serialize_phase;
+logic         bnet_dac_serializer_busy;
+logic         bnet_dac_pair_split;
+logic         bnet_single_dac_output_active;
+logic         bnet_output_pair_available;
+logic         bnet_output_emit_valid;
+logic         bnet_output_drop_valid;
+logic         bnet_capture_pair_valid;
+localparam int unsigned BNET_CAPTURE_DEPTH = BNET_PIPE_VECTOR_LEN;
+localparam int unsigned BNET_CAPTURE_AW = $clog2(BNET_CAPTURE_DEPTH);
+logic [BNET_CAPTURE_AW:0] bnet_capture_count;
+logic [BNET_CAPTURE_AW-1:0] bnet_capture_wr_addr0;
+logic [BNET_CAPTURE_AW-1:0] bnet_capture_wr_addr1;
+logic [32-1:0] bnet_capture_read_addr;
+logic [32-1:0] bnet_capture_read_data;
+logic signed [14-1:0] bnet_capture_ram_dout;
+logic bnet_capture_overflow;
+logic [7-1:0] bnet_adc_combine_high;
+logic         bnet_adc_combine_phase;
+logic [2-1:0] bnet_adc_combine_sample_phase;
+logic         bnet_adc_combine_started;
+SBG_T         bnet_adc_combined_dat;
 
 // ASG outputs. ASG means Arbitrary Signal Generator. Software can load waveform
 // samples into memory through SCPI/API, then the ASG streams those samples out
@@ -414,8 +451,8 @@ assign butterfly_dat[0] = bnet_static_pipeline_active ? bnet_pipe_dat[0] : bnet_
 assign butterfly_dat[1] = bnet_static_pipeline_active ? bnet_pipe_dat[1] : bnet_serial_dat[1];
 assign bnet_output_valid = bnet_static_pipeline_active ? bnet_pipe_output_valid :
                                                      bnet_serial_output_valid;
-assign bnet_busy = bnet_static_pipeline_active ? bnet_pipe_busy : bnet_serial_busy;
-assign bnet_done = bnet_static_pipeline_active ? bnet_pipe_done : bnet_serial_done;
+assign bnet_engine_busy = bnet_static_pipeline_active ? bnet_pipe_busy : bnet_serial_busy;
+assign bnet_engine_done = bnet_static_pipeline_active ? bnet_pipe_done : bnet_serial_done;
 assign bnet_time_total_cycles = bnet_static_pipeline_active ? bnet_pipe_time_total_cycles :
                                                           bnet_serial_time_total_cycles;
 assign bnet_time_load_cycles = bnet_static_pipeline_active ? bnet_pipe_time_weight_load_cycles :
@@ -428,8 +465,125 @@ assign bnet_time_input_load_cycles = bnet_static_pipeline_active ? bnet_pipe_tim
                                                                bnet_serial_time_load_cycles;
 assign bnet_time_latency_cycles = bnet_static_pipeline_active ? bnet_pipe_time_latency_cycles :
                                                            bnet_serial_time_compute_cycles;
-assign bnet_serial_output_ready = !bnet_single_dac_output_en || !bnet_single_dac_hold_valid;
-assign bnet_pipe_output_ready = !bnet_single_dac_output_en || !bnet_single_dac_hold_valid;
+// In normal single-DAC mode each BNET pair occupies two output clocks. Split
+// mode holds each high7/low7 field for four clocks, so one pair occupies
+// sixteen clocks. The combiner samples one of the final two copies after the
+// analog path has had two complete clocks to settle.
+assign bnet_single_dac_output_active = bnet_single_dac_output_en ||
+                                       bnet_split_dac_output_en;
+assign bnet_dac_serializer_busy = |bnet_dac_serialize_phase;
+assign bnet_busy = bnet_engine_busy || bnet_dac_serializer_busy ||
+                   bnet_done_pending;
+assign bnet_serial_output_ready = !bnet_single_dac_output_active ||
+                                  !bnet_dac_serializer_busy;
+assign bnet_pipe_output_ready = !bnet_single_dac_output_active ||
+                                !bnet_dac_serializer_busy;
+assign bnet_output_pair_available = bnet_output_valid &&
+                                    (!bnet_single_dac_output_active ||
+                                     !bnet_dac_serializer_busy);
+assign bnet_output_emit_valid = bnet_output_pair_available &&
+                                (bnet_capture_count <= (BNET_CAPTURE_DEPTH - 2));
+assign bnet_output_drop_valid = bnet_output_pair_available &&
+                               (bnet_capture_count > (BNET_CAPTURE_DEPTH - 2));
+assign bnet_capture_pair_valid = bnet_output_emit_valid;
+assign bnet_capture_wr_addr0 = bnet_capture_count[BNET_CAPTURE_AW-1:0];
+assign bnet_capture_wr_addr1 = bnet_capture_wr_addr0 + 1'b1;
+assign bnet_capture_read_data = {{(32-14){bnet_capture_ram_dout[14-1]}}, bnet_capture_ram_dout};
+
+// Split transport uses a unipolar portion of the ADC/DAC range. Field zero
+// maps to DAC code zero and field 127 maps to 2032, retaining 16 converter
+// codes between neighboring 7-bit symbols without an intentional negative
+// baseline.
+function automatic logic signed [14-1:0] bnet_encode_split_field;
+  input logic [7-1:0] field;
+  begin
+    bnet_encode_split_field = $signed({3'b000, field, 4'b0000});
+  end
+endfunction
+
+function automatic logic [7-1:0] bnet_decode_split_field;
+  input logic signed [14-1:0] sample;
+  integer signed sample_i;
+  integer signed field_i;
+  begin
+    sample_i = $signed(sample);
+    if (sample_i > 0) begin
+      field_i = (sample_i + 8) >>> 4;
+    end else begin
+      field_i = 0;
+    end
+
+    if (field_i > 127) begin
+      bnet_decode_split_field = 7'd127;
+    end else begin
+      bnet_decode_split_field = field_i[6:0];
+    end
+  end
+endfunction
+
+// Optional inverse of the DAC split format for scope acquisition. Each field
+// is held for four clocks. CONFIG[9] selects the third or fourth copy, avoiding
+// the two transition clocks. The reconstructed word updates after eight ADC
+// clocks, so scope decimation 8 returns one word per original sample.
+always_ff @(posedge adc_clk) begin
+  if (!adc_rstn || bnet_soft_reset_pulse || bnet_start_pulse ||
+      !bnet_combine_adc_input_en) begin
+    bnet_adc_combine_high <= '0;
+    bnet_adc_combine_phase <= 1'b0;
+    bnet_adc_combine_sample_phase <= 2'd0;
+    bnet_adc_combine_started <= 1'b0;
+    bnet_adc_combined_dat <= '0;
+  end else if (!bnet_adc_combine_started) begin
+    // Frame the high/low selector from the first accepted output pair instead
+    // of from BNET:START; cold and warm runs have different load latencies.
+    if (bnet_output_emit_valid) begin
+      bnet_adc_combine_started <= 1'b1;
+      bnet_adc_combine_phase <= 1'b0;
+      bnet_adc_combine_sample_phase <= 2'd0;
+    end
+  end else begin
+    bnet_adc_combine_sample_phase <= bnet_adc_combine_sample_phase + 1'b1;
+    if (bnet_adc_combine_sample_phase == {1'b1, bnet_combine_adc_phase}) begin
+      if (!bnet_adc_combine_phase) begin
+        bnet_adc_combine_high <= bnet_decode_split_field(adc_dat[0]);
+        bnet_adc_combine_phase <= 1'b1;
+      end else begin
+        bnet_adc_combined_dat <= {bnet_adc_combine_high,
+                                  bnet_decode_split_field(adc_dat[0])};
+        bnet_adc_combine_phase <= 1'b0;
+      end
+    end
+  end
+end
+
+assign scope_adc_dat[0] = bnet_combine_adc_input_en ? bnet_adc_combined_dat :
+                                                           adc_dat[0];
+assign scope_adc_dat[1] = adc_dat[1];
+
+// The compute engine finishes when it hands over its final pair. In serialized
+// modes, keep busy asserted and delay done until every saved DAC sample has
+// actually been emitted.
+always_ff @(posedge adc_clk) begin
+  if (!adc_rstn || bnet_soft_reset_pulse) begin
+    bnet_done <= 1'b0;
+    bnet_done_pending <= 1'b0;
+  end else begin
+    bnet_done <= 1'b0;
+
+    if (bnet_engine_done) begin
+      if (bnet_single_dac_output_active) begin
+        bnet_done_pending <= 1'b1;
+      end else begin
+        bnet_done <= 1'b1;
+      end
+    end
+
+    if (bnet_done_pending && !bnet_dac_serializer_busy) begin
+      bnet_done <= 1'b1;
+      bnet_done_pending <= 1'b0;
+    end
+  end
+end
 
 always_ff @(posedge adc_clk) begin
   if (!adc_rstn || bnet_soft_reset_pulse) begin
@@ -441,7 +595,11 @@ always_ff @(posedge adc_clk) begin
   end
 end
 
-assign bnet_start_run = (bnet_input_sel == 2'd2) ? |bnet_start_stretch :
+// The stretch register safely carries the software request into the DDR launch
+// path, but the readers and compute engine must see only one start clock. Using
+// the leading stretch bit prevents repeated AXI-reader resets, which otherwise
+// duplicate/drop the first samples and later appear as shifted output spikes.
+assign bnet_start_run = (bnet_input_sel == 2'd2) ? bnet_start_stretch[3] :
                                                      bnet_start_pulse;
 
 always_ff @(posedge adc_clk) begin
@@ -761,6 +919,36 @@ end
 //end
 
 ////////////////////////////////////////////////////////////////////////////////
+// BNET digital output capture
+////////////////////////////////////////////////////////////////////////////////
+
+always_ff @(posedge adc_clk) begin
+  if (!adc_rstn || bnet_soft_reset_pulse || bnet_start_run) begin
+    bnet_capture_count <= '0;
+    bnet_capture_overflow <= 1'b0;
+  end else if (bnet_capture_pair_valid) begin
+    bnet_capture_count <= bnet_capture_count + 2'd2;
+  end else if (bnet_output_drop_valid) begin
+    bnet_capture_overflow <= 1'b1;
+  end
+end
+
+bnet_tdp_ram #(
+  .DW    (14),
+  .DEPTH (BNET_CAPTURE_DEPTH),
+  .AW    (BNET_CAPTURE_AW)
+) i_bnet_output_capture_ram (
+  .clk_i    (adc_clk),
+  .addr_a_i (bnet_capture_pair_valid ? bnet_capture_wr_addr0 : bnet_capture_read_addr[BNET_CAPTURE_AW-1:0]),
+  .din_a_i  (butterfly_dat[0]),
+  .we_a_i   (bnet_capture_pair_valid),
+  .dout_a_o (bnet_capture_ram_dout),
+  .addr_b_i (bnet_capture_wr_addr1),
+  .din_b_i  (butterfly_dat[1]),
+  .we_b_i   (bnet_capture_pair_valid),
+  .dout_b_o ()
+);
+////////////////////////////////////////////////////////////////////////////////
 // DAC IO
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -832,6 +1020,7 @@ always_comb begin
     2'd1: begin
       bnet_sample_dat = adc_dat[0][14-1:0];
       bnet_weight_dat = asg_dat[1];
+      bnet_sample_valid = 1'b1;
     end
     2'd2: begin
       bnet_sample_dat = bnet_ddr_sample_dat;
@@ -881,8 +1070,44 @@ butterfly_network #(
   .timing_playback_cycles_o (bnet_serial_time_playback_cycles)
 );
 
-// Fixed-weight frame-pipeline draft. This path preloads static weights from
-// stream 1, then accepts input frames from stream 0. It is selected by CONFIG[5].
+// Fixed-weight static pipeline. By default this is the proven full-frame
+// pipeline. When BNET_ENABLE_SDF is defined at synthesis time, the same static
+// CONFIG[5] path is implemented by the experimental SDF streaming engine
+// instead, avoiding the BRAM cost of instantiating both engines together.
+`ifdef BNET_ENABLE_SDF
+butterfly_network_static_sdf #(
+  .IN_DW       (14),
+  .OUT_DW      (14),
+  .WEIGHT_DW   (7),
+  .WEIGHT_FRAC (6),
+  .VECTOR_LEN  (BNET_PIPE_VECTOR_LEN)
+) i_butterfly_static_sdf (
+  .clk_i    (adc_clk),
+  .rstn_i   (adc_rstn),
+  .soft_reset_i (bnet_soft_reset_pulse),
+  .start_i (bnet_start_pulse),
+  .vector_len_i (bnet_vector_len),
+  .weight_bank_i (bnet_weight_bank),
+  .weight_load_valid_i (bnet_static_pipeline_active && bnet_weight_valid),
+  .weight_load_ready_o (bnet_pipe_weight_ready),
+  .weight_load_i (bnet_weight_dat),
+  .weight_load_done_o (bnet_pipe_weight_done),
+  .sample_valid_i (bnet_static_pipeline_active && bnet_sample_valid),
+  .sample_ready_o (bnet_pipe_sample_ready),
+  .sample_i (bnet_sample_dat),
+  .y0_o (bnet_pipe_dat[0]),
+  .y1_o (bnet_pipe_dat[1]),
+  .output_valid_o (bnet_pipe_output_valid),
+  .output_ready_i (bnet_pipe_output_ready),
+  .busy_o (bnet_pipe_busy),
+  .done_o (bnet_pipe_done),
+  .timing_total_cycles_o (bnet_pipe_time_total_cycles),
+  .timing_weight_load_cycles_o (bnet_pipe_time_weight_load_cycles),
+  .timing_input_load_cycles_o (bnet_pipe_time_input_load_cycles),
+  .timing_latency_cycles_o (bnet_pipe_time_latency_cycles),
+  .timing_output_cycles_o (bnet_pipe_time_output_cycles)
+);
+`else
 butterfly_network_static_pipeline #(
   .IN_DW       (14),
   .OUT_DW      (14),
@@ -912,33 +1137,114 @@ butterfly_network_static_pipeline #(
   .timing_latency_cycles_o (bnet_pipe_time_latency_cycles),
   .timing_output_cycles_o (bnet_pipe_time_output_cycles)
 );
+`endif
 
-// Optional single-DAC output mode. The BNET engines naturally produce two
-// neighboring output samples per clock. CONFIG[6] serializes those two lanes
-// onto DAC A over two clocks and drives DAC B to zero. The output_ready
-// backpressure above prevents the engines from advancing while the saved odd
-// lane sample is being emitted.
+// Single-DAC BNET output mode. Without splitting, a pair is emitted as y0,y1.
+// With splitting, it is emitted as y0[13:7], y0[6:0], y1[13:7], y1[6:0],
+// holding each field for four clocks. Each unsigned field is scaled by 16, so
+// fields 0..127 map monotonically to DAC codes 0..2032. Backpressure keeps the
+// pair stable until all sixteen split clocks complete.
 always_ff @(posedge adc_clk) begin
   if (!adc_rstn || bnet_soft_reset_pulse) begin
     bnet_dac_dat[0] <= '0;
     bnet_dac_dat[1] <= '0;
-    bnet_single_dac_hold <= '0;
-    bnet_single_dac_hold_valid <= 1'b0;
-  end else if (bnet_single_dac_output_en) begin
-    if (bnet_single_dac_hold_valid) begin
-      bnet_dac_dat[0] <= bnet_single_dac_hold;
+    bnet_dac_pair_hold <= '0;
+    bnet_dac_serialize_phase <= 4'd0;
+    bnet_dac_pair_split <= 1'b0;
+  end else if (bnet_single_dac_output_active) begin
+    if (bnet_dac_serializer_busy) begin
       bnet_dac_dat[1] <= '0;
-      bnet_single_dac_hold_valid <= 1'b0;
-    end else if (bnet_output_valid) begin
-      bnet_dac_dat[0] <= butterfly_dat[0];
+      case (bnet_dac_serialize_phase)
+        4'd1: begin
+          bnet_dac_dat[0] <= bnet_dac_pair_split ?
+                             bnet_encode_split_field(bnet_dac_pair_hold[0][13:7]) :
+                             bnet_dac_pair_hold[1];
+          bnet_dac_serialize_phase <= bnet_dac_pair_split ? 4'd2 : 4'd0;
+        end
+        4'd2: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[0][13:7]);
+          bnet_dac_serialize_phase <= 4'd3;
+        end
+        4'd3: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[0][13:7]);
+          bnet_dac_serialize_phase <= 4'd4;
+        end
+        4'd4: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[0][6:0]);
+          bnet_dac_serialize_phase <= 4'd5;
+        end
+        4'd5: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[0][6:0]);
+          bnet_dac_serialize_phase <= 4'd6;
+        end
+        4'd6: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[0][6:0]);
+          bnet_dac_serialize_phase <= 4'd7;
+        end
+        4'd7: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[0][6:0]);
+          bnet_dac_serialize_phase <= 4'd8;
+        end
+        4'd8: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][13:7]);
+          bnet_dac_serialize_phase <= 4'd9;
+        end
+        4'd9: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][13:7]);
+          bnet_dac_serialize_phase <= 4'd10;
+        end
+        4'd10: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][13:7]);
+          bnet_dac_serialize_phase <= 4'd11;
+        end
+        4'd11: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][13:7]);
+          bnet_dac_serialize_phase <= 4'd12;
+        end
+        4'd12: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][6:0]);
+          bnet_dac_serialize_phase <= 4'd13;
+        end
+        4'd13: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][6:0]);
+          bnet_dac_serialize_phase <= 4'd14;
+        end
+        4'd14: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][6:0]);
+          bnet_dac_serialize_phase <= 4'd15;
+        end
+        4'd15: begin
+          bnet_dac_dat[0] <= bnet_encode_split_field(bnet_dac_pair_hold[1][6:0]);
+          bnet_dac_serialize_phase <= 4'd0;
+        end
+        default: begin
+          bnet_dac_dat[0] <= '0;
+          bnet_dac_serialize_phase <= 4'd0;
+        end
+      endcase
+    end else if (bnet_output_emit_valid) begin
+      bnet_dac_dat[0] <= bnet_split_dac_output_en ?
+                         bnet_encode_split_field(butterfly_dat[0][13:7]) :
+                         butterfly_dat[0];
       bnet_dac_dat[1] <= '0;
-      bnet_single_dac_hold <= butterfly_dat[1];
-      bnet_single_dac_hold_valid <= 1'b1;
+      bnet_dac_pair_hold[0] <= butterfly_dat[0];
+      bnet_dac_pair_hold[1] <= butterfly_dat[1];
+      bnet_dac_pair_split <= bnet_split_dac_output_en;
+      bnet_dac_serialize_phase <= 4'd1;
+    end else if (!bnet_engine_busy) begin
+      bnet_dac_dat[0] <= '0;
+      bnet_dac_dat[1] <= '0;
     end
   end else begin
-    bnet_dac_dat[0] <= butterfly_dat[0];
-    bnet_dac_dat[1] <= butterfly_dat[1];
-    bnet_single_dac_hold_valid <= 1'b0;
+    bnet_dac_serialize_phase <= 4'd0;
+    bnet_dac_pair_split <= 1'b0;
+    if (bnet_output_emit_valid) begin
+      bnet_dac_dat[0] <= butterfly_dat[0];
+      bnet_dac_dat[1] <= butterfly_dat[1];
+    end else if (!bnet_engine_busy) begin
+      bnet_dac_dat[0] <= '0;
+      bnet_dac_dat[1] <= '0;
+    end
   end
 end
 
@@ -1155,7 +1461,7 @@ rp_scope_com #(
   .RSZ(14)) 
   i_scope (
   // ADC
-  .adc_dat_i     ({adc_dat[1], adc_dat[0]}  ),
+  .adc_dat_i     ({scope_adc_dat[1], scope_adc_dat[0]}  ),
   .adc_clk_i     ({2{adc_clk}}  ),  // clock
   .adc_rstn_i    ({2{adc_rstn}} ),  // reset - active low
   .trig_ext_i    (trig_ext    ),  // external trigger
@@ -1417,6 +1723,11 @@ red_pitaya_daisy  #(
     .static_weight_reuse_o (bnet_static_weight_reuse),
     .static_pipeline_en_o (bnet_static_pipeline_en),
     .single_dac_output_en_o (bnet_single_dac_output_en),
+    .split_dac_output_en_o (bnet_split_dac_output_en),
+    .combine_adc_input_en_o (bnet_combine_adc_input_en),
+    .combine_adc_phase_o (bnet_combine_adc_phase),
+    .vector_len_o (bnet_vector_len),
+    .weight_bank_o (bnet_weight_bank),
     .start_pulse_o  (bnet_start_pulse),
     .soft_reset_pulse_o (bnet_soft_reset_pulse),
     .compute_busy_i (bnet_busy),
@@ -1428,6 +1739,10 @@ red_pitaya_daisy  #(
     .timing_playback_cycles_i (bnet_time_playback_cycles),
     .timing_input_load_cycles_i (bnet_time_input_load_cycles),
     .timing_latency_cycles_i (bnet_time_latency_cycles),
+    .capture_count_i ({{(32-(BNET_CAPTURE_AW+1)){1'b0}}, bnet_capture_count}),
+    .capture_overflow_i (bnet_capture_overflow),
+    .capture_read_addr_o (bnet_capture_read_addr),
+    .capture_read_data_i (bnet_capture_read_data),
     .stream_base0_o (bnet_stream_base0),
     .stream_base1_o (bnet_stream_base1),
     .stream_length_o(bnet_stream_length),

@@ -34,12 +34,25 @@
 //                 [4] reuse preloaded static butterfly weights
 //                 [5] select fixed-weight frame pipeline
 //                 [6] serialize full BNET vector onto DAC A; DAC B is zero
+//                 [7] split each 14-bit result into high/low 7-bit DAC samples
+//                     using centered offset-binary transport; this also forces
+//                     single-DAC output
+//                 [8] combine neighboring IN1 ADC[13:7] fields into one
+//                     14-bit word for scope acquisition; IN2 remains raw
+//                 [9] ADC combine phase: 0 pairs (0,1), 1 pairs (1,2)
 //   0x50  TIME_TOTAL RO last start-to-done time in adc_clk cycles
 //   0x54  TIME_LOAD RO last DDR/load time in adc_clk cycles
 //   0x58  TIME_COMPUTE RO last staged compute time in adc_clk cycles
 //   0x5c  TIME_PLAYBACK RO last output playback period in adc_clk cycles
 //   0x60  TIME_INPUT_LOAD RO pipeline input-frame load time in adc_clk cycles
 //   0x64  TIME_LATENCY RO pipeline input-complete to first-output latency
+//   0x68  CAPTURE_COUNT RO number of serialized BNET output samples captured
+//   0x6c  CAPTURE_ADDR RW read address for digital output capture RAM
+//   0x70  CAPTURE_DATA RO sign-extended captured BNET output sample
+//   0x74  CAPTURE_STATUS RO [0] capture overflow/suppressed extra output
+//   0x78  WEIGHT_BANK RW [1:0] selected static-weight bank, [31] selection
+//                     armed. Legal banks: 0..3 for 1024, 0..1 for 2048.
+//                     4096 always uses bank 0 and ignores bank writes.
 //
 // Per-stream descriptor window:
 //   stream n base = 0x100 + n * 0x40
@@ -78,6 +91,11 @@ module bnet_regs #(
   output logic          static_weight_reuse_o,
   output logic          static_pipeline_en_o,
   output logic          single_dac_output_en_o,
+  output logic          split_dac_output_en_o,
+  output logic          combine_adc_input_en_o,
+  output logic          combine_adc_phase_o,
+  output logic [32-1:0] vector_len_o,
+  output logic [ 2-1:0] weight_bank_o,
   output logic          start_pulse_o,
   output logic          soft_reset_pulse_o,
   input  logic          compute_busy_i,
@@ -89,6 +107,10 @@ module bnet_regs #(
   input  logic [32-1:0] timing_playback_cycles_i,
   input  logic [32-1:0] timing_input_load_cycles_i,
   input  logic [32-1:0] timing_latency_cycles_i,
+  input  logic [32-1:0] capture_count_i,
+  input  logic          capture_overflow_i,
+  output logic [32-1:0] capture_read_addr_o,
+  input  logic [32-1:0] capture_read_data_i,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base0_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_base1_o,
   output logic [STREAM_COUNT-1:0][32-1:0] stream_length_o,
@@ -128,6 +150,11 @@ module bnet_regs #(
   localparam logic [20-1:0] REG_TIME_PLAYBACK = 20'h0005c;
   localparam logic [20-1:0] REG_TIME_INPUT_LOAD = 20'h00060;
   localparam logic [20-1:0] REG_TIME_LATENCY = 20'h00064;
+  localparam logic [20-1:0] REG_CAPTURE_COUNT = 20'h00068;
+  localparam logic [20-1:0] REG_CAPTURE_ADDR  = 20'h0006c;
+  localparam logic [20-1:0] REG_CAPTURE_DATA  = 20'h00070;
+  localparam logic [20-1:0] REG_CAPTURE_STATUS = 20'h00074;
+  localparam logic [20-1:0] REG_WEIGHT_BANK = 20'h00078;
 
   localparam logic [20-1:0] STREAM_BASE   = 20'h00100;
   localparam logic [20-1:0] STREAM_STRIDE = 20'h00040;
@@ -145,12 +172,15 @@ module bnet_regs #(
   localparam logic [6-1:0] STREAM_REG_RPTR   = 6'h1c;
   localparam logic [6-1:0] STREAM_REG_DBG0   = 6'h20;
   localparam logic [6-1:0] STREAM_REG_DBG1   = 6'h24;
-  localparam logic [32-1:0] DEFAULT_VECTOR_LEN = 32'd2048;
+  localparam logic [32-1:0] DEFAULT_VECTOR_LEN = 32'd4096;
 
   logic [32-1:0] control_reg;
   logic [32-1:0] status_reg;
   logic [32-1:0] config_reg;
   logic [32-1:0] vector_len_reg;
+  logic [2-1:0]  weight_bank_reg;
+  logic          weight_bank_selected;
+  logic [32-1:0] capture_read_addr_reg;
   logic [32-1:0] ch_data [0:7];
   logic [32-1:0] out_data [0:3];
   logic [32-1:0] stream_base0 [0:STREAM_COUNT-1];
@@ -200,6 +230,12 @@ module bnet_regs #(
   assign static_weight_reuse_o = config_reg[4];
   assign static_pipeline_en_o = config_reg[5];
   assign single_dac_output_en_o = config_reg[6];
+  assign split_dac_output_en_o = config_reg[7];
+  assign combine_adc_input_en_o = config_reg[8];
+  assign combine_adc_phase_o = config_reg[9];
+  assign vector_len_o = vector_len_reg;
+  assign weight_bank_o = weight_bank_reg;
+  assign capture_read_addr_o = capture_read_addr_reg;
   assign stream_enable_o = stream_enable;
   assign stream_active_buf_o = stream_active_buf;
 
@@ -221,6 +257,9 @@ module bnet_regs #(
       start_pulse_o <= 1'b0;
       soft_reset_pulse_o <= 1'b0;
       vector_len_reg <= DEFAULT_VECTOR_LEN;
+      weight_bank_reg <= 2'd0;
+      weight_bank_selected <= 1'b0;
+      capture_read_addr_reg <= 32'd0;
       for (int i = 0; i < 8; i++) begin
         ch_data[i] <= 32'd0;
       end
@@ -253,16 +292,26 @@ module bnet_regs #(
           end
 
           if (config_reg[3] && auto_restart_allowed) begin
-            start_pulse_o <= 1'b1;
-            status_reg[1] <= 1'b0;
+            if ((vector_len_reg == 32'd4096) || weight_bank_selected) begin
+              start_pulse_o <= 1'b1;
+              status_reg[1] <= 1'b0;
+              status_reg[2] <= 1'b0;
+              if (vector_len_reg != 32'd4096) begin
+                weight_bank_selected <= 1'b0;
+              end
+            end else begin
+              status_reg[2] <= 1'b1;
+            end
           end
         end
       end
-      status_reg[2] <= 1'b0; // error: reserved for later buffer/controller work.
       status_reg[3] <= |stream_pending_valid;
       status_reg[4] <= compute_output_valid_i;
 
-      if (sys_wen_i) begin
+      // A sys_bus request remains asserted until ack. Execute writes only on
+      // the first request clock so pulse registers and one-shot bank arming are
+      // not consumed a second time by the same software transaction.
+      if (sys_wen_i && !sys_ack_o) begin
         case (sys_addr_i[19:0])
           REG_CONTROL: begin
             if (sys_wdata_i[1]) begin
@@ -271,6 +320,9 @@ module bnet_regs #(
               config_reg  <= 32'd0;
               soft_reset_pulse_o <= 1'b1;
               vector_len_reg <= DEFAULT_VECTOR_LEN;
+              weight_bank_reg <= 2'd0;
+              weight_bank_selected <= 1'b0;
+              capture_read_addr_reg <= 32'd0;
               for (int i = 0; i < 8; i++) begin
                 ch_data[i] <= 32'd0;
               end
@@ -290,13 +342,21 @@ module bnet_regs #(
             end else begin
               control_reg <= sys_wdata_i;
               if (sys_wdata_i[0]) begin
-                start_pulse_o <= 1'b1;
-                status_reg[1] <= 1'b0;
-                for (int i = 0; i < STREAM_COUNT; i++) begin
-                  if (stream_pending_valid[i]) begin
-                    stream_active_buf[i] <= stream_pending_buf[i];
-                    stream_pending_valid[i] <= 1'b0;
+                if ((vector_len_reg == 32'd4096) || weight_bank_selected) begin
+                  start_pulse_o <= 1'b1;
+                  status_reg[1] <= 1'b0;
+                  status_reg[2] <= 1'b0;
+                  if (vector_len_reg != 32'd4096) begin
+                    weight_bank_selected <= 1'b0;
                   end
+                  for (int i = 0; i < STREAM_COUNT; i++) begin
+                    if (stream_pending_valid[i]) begin
+                      stream_active_buf[i] <= stream_pending_buf[i];
+                      stream_pending_valid[i] <= 1'b0;
+                    end
+                  end
+                end else begin
+                  status_reg[2] <= 1'b1;
                 end
               end
               if (sys_wdata_i[5]) begin
@@ -317,8 +377,44 @@ module bnet_regs #(
           REG_CH5: ch_data[5] <= sys_wdata_i;
           REG_CH6: ch_data[6] <= sys_wdata_i;
           REG_CH7: ch_data[7] <= sys_wdata_i;
-          REG_VECTOR_LEN: vector_len_reg <= sys_wdata_i;
+          REG_VECTOR_LEN: begin
+            case (sys_wdata_i)
+              32'd1024: vector_len_reg <= 32'd1024;
+              32'd2048: begin
+                vector_len_reg <= 32'd2048;
+                if (weight_bank_reg > 2'd1) weight_bank_reg <= 2'd0;
+              end
+              32'd4096: begin
+                vector_len_reg <= 32'd4096;
+                weight_bank_reg <= 2'd0;
+              end
+              default: begin
+              end
+            endcase
+            weight_bank_selected <= 1'b0;
+          end
           REG_CONFIG: config_reg <= sys_wdata_i;
+          REG_CAPTURE_ADDR: capture_read_addr_reg <= sys_wdata_i;
+          REG_WEIGHT_BANK: begin
+            case (vector_len_reg)
+              32'd1024: begin
+                if (sys_wdata_i < 32'd4) begin
+                  weight_bank_reg <= sys_wdata_i[1:0];
+                  weight_bank_selected <= 1'b1;
+                end
+              end
+              32'd2048: begin
+                if (sys_wdata_i < 32'd2) begin
+                  weight_bank_reg <= sys_wdata_i[1:0];
+                  weight_bank_selected <= 1'b1;
+                end
+              end
+              default: begin
+                weight_bank_reg <= 2'd0;
+                weight_bank_selected <= 1'b0;
+              end
+            endcase
+          end
           default: begin
             if (stream_access) begin
               case (stream_reg_offset)
@@ -411,6 +507,12 @@ module bnet_regs #(
         REG_TIME_PLAYBACK: sys_rdata_o <= timing_playback_cycles_i;
         REG_TIME_INPUT_LOAD: sys_rdata_o <= timing_input_load_cycles_i;
         REG_TIME_LATENCY: sys_rdata_o <= timing_latency_cycles_i;
+        REG_CAPTURE_COUNT: sys_rdata_o <= capture_count_i;
+        REG_CAPTURE_ADDR:  sys_rdata_o <= capture_read_addr_reg;
+        REG_CAPTURE_DATA:  sys_rdata_o <= capture_read_data_i;
+        REG_CAPTURE_STATUS: sys_rdata_o <= {31'd0, capture_overflow_i};
+        REG_WEIGHT_BANK: sys_rdata_o <= {weight_bank_selected, 29'd0,
+                                         weight_bank_reg};
         default: begin
           if (stream_access) begin
             case (stream_reg_offset)
