@@ -1310,6 +1310,12 @@ logic [DWE-1: 0] exp_p_alt,  exp_n_alt;
 logic [DWE-1: 0] exp_p_altr, exp_n_altr;
 logic [DWE-1: 0] exp_p_altd, exp_n_altd;
 
+// One single-ended 3.3 V GPIO: DIO1_P, E1 pin 5, FPGA H16.
+// The selected IOBUF is driven directly by pulse_gen's ODDR, including normal
+// GPIO passthrough while unclaimed. No fabric mux may be added after ODDR Q.
+localparam integer PULSE_GPIO_INDEX = 1;
+logic pulse_pin_data, pulse_pin_dir;
+
 logic [8-1:0] led_hk;
 logic [26-1:0] fpga_marker_cnt;
 logic [8-1:0] bnet_led_debug;
@@ -1414,6 +1420,14 @@ for(GM = 0 ; GM < DWE ; GM = GM + 1) begin : gpios
 
   assign exp_p_dtr[GM] = exp_p_alt[GM] ? exp_p_altd[GM] : exp_p_dir[GM];
   assign exp_n_dtr[GM] = exp_n_alt[GM] ? exp_n_altd[GM] : exp_n_dir[GM];
+
+  if (GM == PULSE_GPIO_INDEX) begin : pulse_pin
+    IOBUF i_iobufp (.O(exp_p_in[GM]), .IO(exp_p_io[GM]),
+                   .I(pulse_pin_data), .T(~pulse_pin_dir));
+  end else begin : normal_pin
+    IOBUF i_iobufp (.O(exp_p_in[GM]), .IO(exp_p_io[GM]),
+                   .I(exp_p_otr[GM]), .T(~exp_p_dtr[GM]));
+  end
 end
 endgenerate
 
@@ -1421,7 +1435,6 @@ endgenerate
 // - T = 1: output driver is disabled, pin acts as an input
 // - T = 0: output driver is enabled, pin is driven by I
 // Since exp_*_dtr uses 1 for output-enable, this code passes ~exp_*_dtr to T.
-IOBUF i_iobufp [DWE-1:0] (.O(exp_p_in), .IO(exp_p_io), .I(exp_p_otr), .T(~exp_p_dtr) );
 IOBUF i_iobufn [DWE-1:0] (.O(exp_n_in), .IO(exp_n_io), .I(exp_n_otr), .T(~exp_n_dtr) );
 
 // Pack the physical expansion connector inputs into the wider PS GPIO input
@@ -1701,9 +1714,35 @@ red_pitaya_daisy  #(
   sys_bus_stub sys_bus_stub_6 (sys[6]);
   `endif
 
-  // sys[7] is the custom butterfly-network scalar register block. With SW=20
-  // in the interconnect above, this occupies the 0x0070_0000 FPGA bus region
-  // relative to the /dev/uio/api map used by Red Pitaya software.
+  // Slot 7 local decode: 0x40700000 BNET; 0x40720000 pulse generator.
+  // Region 1 (0x40710000) is reserved for the TDC on the other checkout.
+  // This checkout has no TDC HDL, so region 1 and unknown regions return errors.
+  // On merging, retain the TDC decoder/instance as a separate region-1 branch.
+  logic [31:0] bnet_bus_rdata, pulse_bus_rdata;
+  logic bnet_bus_ack, bnet_bus_err, pulse_bus_ack, pulse_bus_err;
+  wire bnet_bus_select = sys[7].addr[19:16] == 4'h0;
+  wire pulse_bus_select = sys[7].addr[19:16] == 4'h2;
+  assign sys[7].rdata = bnet_bus_select ? bnet_bus_rdata :
+                        pulse_bus_select ? pulse_bus_rdata : 32'd0;
+  assign sys[7].ack = bnet_bus_select ? bnet_bus_ack :
+                      pulse_bus_select ? pulse_bus_ack : (sys[7].wen | sys[7].ren);
+  assign sys[7].err = bnet_bus_select ? bnet_bus_err :
+                      pulse_bus_select ? pulse_bus_err : (sys[7].wen | sys[7].ren);
+
+  pulse_gen #(.GPIO_INDEX(PULSE_GPIO_INDEX)) i_pulse_gen (
+    // ser_clk is the existing 250 MHz PLL output. Its paths are separate from
+    // the legacy broad ADC-to-DAC false paths in sdc/red_pitaya.xdc.
+    .bus_clk_i(adc_clk), .fast_clk_i(ser_clk),
+    .arstn_i(frstn[0] & pll_locked & ~rst_after_locked),
+    .sys_addr_i(sys[7].addr), .sys_wdata_i(sys[7].wdata),
+    .sys_wen_i(sys[7].wen & pulse_bus_select),
+    .sys_ren_i(sys[7].ren & pulse_bus_select),
+    .sys_rdata_o(pulse_bus_rdata), .sys_err_o(pulse_bus_err), .sys_ack_o(pulse_bus_ack),
+    .gpio_data_i(exp_p_otr[PULSE_GPIO_INDEX]),
+    .gpio_dir_i(exp_p_dtr[PULSE_GPIO_INDEX]),
+    .pin_data_o(pulse_pin_data), .pin_dir_o(pulse_pin_dir)
+  );
+
   bnet_regs #(
     .STREAM_COUNT (BNET_STREAM_COUNT)
   ) i_bnet_regs (
@@ -1711,11 +1750,11 @@ red_pitaya_daisy  #(
     .rstn_i         (adc_rstn        ),
     .sys_addr_i     (sys[7].addr     ),
     .sys_wdata_i    (sys[7].wdata    ),
-    .sys_wen_i      (sys[7].wen      ),
-    .sys_ren_i      (sys[7].ren      ),
-    .sys_rdata_o    (sys[7].rdata    ),
-    .sys_err_o      (sys[7].err      ),
-    .sys_ack_o      (sys[7].ack      ),
+    .sys_wen_i      (sys[7].wen & bnet_bus_select),
+    .sys_ren_i      (sys[7].ren & bnet_bus_select),
+    .sys_rdata_o    (bnet_bus_rdata  ),
+    .sys_err_o      (bnet_bus_err    ),
+    .sys_ack_o      (bnet_bus_ack    ),
     .led_debug_o    (bnet_led_debug  ),
     .led_debug_en_o (bnet_led_debug_en),
     .led6_heartbeat_en_o (bnet_led6_heartbeat_en),

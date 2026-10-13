@@ -90,6 +90,12 @@ add_files                         ../../$path_rtl
 add_files -fileset constrs_1      $path_sdc/red_pitaya.xdc
 }
 
+if {$prj_name == "v0.94"} {
+  foreach top_file [get_files -quiet *red_pitaya_top*.sv] {
+    if {[file tail $top_file] != "red_pitaya_top_LED7_mod.sv"} { remove_files $top_file }
+  }
+}
+
 set ip_files [glob -nocomplain $path_ip/*.xci]
 if {$ip_files != ""} {
 read_ip                         $ip_files
@@ -117,6 +123,10 @@ synth_ip [get_ips sync_fifo]
 # synth_ip [get_ips *]
 #
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya_G2.xdc
+if {$prj_name == "v0.94" && [lsearch -exact $prj_defs SCOPE_ONLY] < 0} {
+  add_files -fileset constrs_1 $path_sdc_prj/pulse_gen_Z20_G2.xdc
+  set_property USED_IN_SYNTHESIS false [get_files $path_sdc_prj/pulse_gen_Z20_G2.xdc]
+}
 
 ################################################################################
 # ser parameter containing Git hash
