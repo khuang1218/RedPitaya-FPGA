@@ -52,7 +52,7 @@ set ::hp1_clk_freq 125000000
 set ::hp2_clk_freq 250000000
 set ::hp3_clk_freq 250000000
 
-set_property verilog_define [concat Z20_G2 $prj_defs] [current_fileset]
+set_property verilog_define [concat Z20_G2 Z20_xx $prj_defs] [current_fileset]
 
 source                            $path_ip/systemZ20_G2.tcl
 
@@ -72,6 +72,14 @@ add_files                         $path_bd
 if {$prj_name != "pyrpl"} {
 add_files                         ../../$path_rtl
 add_files -fileset constrs_1      $path_sdc/red_pitaya.xdc
+}
+
+# v0.94 contains several files defining red_pitaya_top. Select the BNET/pulse
+# integration explicitly instead of depending on duplicate-module compile order.
+if {$prj_name == "v0.94"} {
+  foreach top_file [get_files -quiet *red_pitaya_top*.sv] {
+    if {[file tail $top_file] != "red_pitaya_top_LED7_mod.sv"} { remove_files $top_file }
+  }
 }
 
 #if {$prj_name == "v0.94"} {
@@ -96,7 +104,6 @@ upgrade_ip [get_ips *]
 
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya.xdc
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya_G2.xdc
-add_files -fileset constrs_1      $path_sdc_prj/tdc_Z20_G2.xdc
 
 ################################################################################
 # start gui
