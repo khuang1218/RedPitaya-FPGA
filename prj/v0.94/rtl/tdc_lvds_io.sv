@@ -4,7 +4,7 @@
 
 (* KEEP_HIERARCHY = "TRUE" *)
 module tdc_lvds_io #(
-  parameter bit RETURN_DIFF_TERM = 1'b0
+  parameter bit RETURN_DIFF_TERM = 1'b1
 )(
   input  logic launch_i,
   output logic launch_p_o,

@@ -26,6 +26,7 @@ module tdc_registers #(
   output logic                    calibration_mode_o,
   output logic                    internal_test_enable_o,
   output logic                    mmcm_sweep_enable_o,
+  output logic                    single_ended_select_o,
   output logic                    mmcm_reset_o,
   output logic                    mmcm_ps_request_o,
   output logic                    mmcm_ps_incdec_o,
@@ -77,7 +78,7 @@ module tdc_registers #(
   input  logic                    calibration_complete_i
 );
 
-  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_4303; // "TDC", v3: + MMCM phase sweep
+  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_4304; // "TDC", v4: selectable external input
 
   localparam logic [15:0] REG_ID_VERSION       = 16'h0000;
   localparam logic [15:0] REG_CONTROL          = 16'h0004;
@@ -115,6 +116,7 @@ module tdc_registers #(
   localparam logic [15:0] REG_MMCM_STATUS      = 16'h0084;
   localparam logic [15:0] REG_MMCM_COARSE_DLY  = 16'h0088;
   localparam logic [15:0] REG_MMCM_PHASE_CNT   = 16'h008c;
+  localparam logic [15:0] REG_INPUT_SELECT     = 16'h0090;
 
   localparam int unsigned RAW_WORDS = (NUM_TAPS + 31) / 32;
 
@@ -165,6 +167,7 @@ module tdc_registers #(
       REG_CAL_TARGET: valid_read = 1'b1;
       REG_MMCM_CONTROL, REG_MMCM_STATUS, REG_MMCM_COARSE_DLY,
       REG_MMCM_PHASE_CNT: valid_read = 1'b1;
+      REG_INPUT_SELECT: valid_read = 1'b1;
       default: valid_read = 1'b0;
     endcase
 
@@ -177,6 +180,9 @@ module tdc_registers #(
         valid_write = 1'b1;
       REG_CAL_TARGET: valid_write = 1'b1;
       REG_MMCM_CONTROL, REG_MMCM_COARSE_DLY: valid_write = 1'b1;
+      // Do not let a source change create a measurement edge mid-acquisition.
+      REG_INPUT_SELECT: valid_write = !enable_o && !busy_i &&
+                                      (sys_wdata_i[31:1] == 31'd0);
       default: valid_write = 1'b0;
     endcase
   end
@@ -184,6 +190,7 @@ module tdc_registers #(
   always_ff @(posedge clk_i) begin
     if (!rstn_i) begin
       control_reg                 <= 32'd0;
+      single_ended_select_o       <= 1'b0;
       launch_period_reg           <= 32'd125000;
       launch_width_reg            <= 32'd2;
       timeout_cycles_reg          <= 32'd125000;
@@ -265,6 +272,17 @@ module tdc_registers #(
             mmcm_timeout_clear_o      <= sys_wdata_i[4];
           end
           REG_MMCM_COARSE_DLY: mmcm_coarse_delay_o <= sys_wdata_i[15:0];
+          REG_INPUT_SELECT: begin
+            single_ended_select_o <= sys_wdata_i[0];
+            if (single_ended_select_o != sys_wdata_i[0]) begin
+              // Results and calibration collected through another input path
+              // must not silently carry over. Keep the source across soft reset.
+              soft_reset_o  <= 1'b1;
+              fifo_clear_o  <= 1'b1;
+              histogram_clear_o <= 1'b1;
+              control_reg[7] <= 1'b0;
+            end
+          end
           REG_CAL_ADDR, REG_HIST_ADDR:
             calibration_addr_o <= sys_wdata_i[INDEX_W-1:0];
           REG_CAL_DATA:
@@ -350,6 +368,7 @@ module tdc_registers #(
                                               mmcm_ps_busy_i, mmcm_locked_i};
         REG_MMCM_COARSE_DLY:  sys_rdata_o <= {16'd0, mmcm_coarse_delay_o};
         REG_MMCM_PHASE_CNT:   sys_rdata_o <= mmcm_phase_count_i;
+        REG_INPUT_SELECT:     sys_rdata_o <= {31'd0, single_ended_select_o};
         default:              sys_rdata_o <= 32'd0;
       endcase
     end

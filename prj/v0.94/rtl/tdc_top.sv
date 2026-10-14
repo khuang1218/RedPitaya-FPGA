@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// LVDS launch/return time-to-digital converter top level.
+// LVDS launch, selectable LVDS / single-ended return TDC top level.
 ////////////////////////////////////////////////////////////////////////////////
 
 (* KEEP_HIERARCHY = "TRUE" *)
@@ -10,7 +10,7 @@ module tdc_top #(
   parameter int unsigned FIFO_DEPTH = 256,
   parameter int unsigned FIFO_AW    = $clog2(FIFO_DEPTH),
   parameter bit          INVERT_TAPS = 1'b0,
-  parameter bit          RETURN_DIFF_TERM = 1'b0
+  parameter bit          RETURN_DIFF_TERM = 1'b1
 )(
   input  logic                clk_i,
   input  logic                rstn_i,
@@ -21,6 +21,7 @@ module tdc_top #(
   output logic                launch_n_o,
   input  logic                return_p_i,
   input  logic                return_n_i,
+  input  logic                return_single_i,
 
   input  logic [31:0]         sys_addr_i,
   input  logic [31:0]         sys_wdata_i,
@@ -49,11 +50,12 @@ module tdc_top #(
 
   logic launch_internal;
   logic return_event;
+  logic single_ended_select;
   logic internal_test_event;
   logic mmcm_event;
   logic measurement_event;
-  logic return_sync_meta;
-  logic return_sync;
+  (* ASYNC_REG = "TRUE" *) logic return_sync_meta;
+  (* ASYNC_REG = "TRUE" *) logic return_sync;
   logic [NUM_TAPS-1:0] sampled_taps;
   logic [NUM_TAPS-1:0] captured_taps;
 
@@ -144,7 +146,10 @@ module tdc_top #(
 
   assign core_rstn = rstn_i & ~soft_reset;
   assign measurement_event = mmcm_sweep_enable ? mmcm_event :
-                             (internal_test_enable ? internal_test_event : return_event);
+                             (internal_test_enable ? internal_test_event :
+                              (single_ended_select ? return_single_i : return_event));
+  // The external event goes directly to the delay line. Synchronizing it here
+  // would remove the sub-clock arrival information being measured.
 
   tdc_internal_stimulus #(
     .DIVIDER_BIT(10)
@@ -276,6 +281,7 @@ module tdc_top #(
     .calibration_mode_o          (calibration_mode),
     .internal_test_enable_o      (internal_test_enable),
     .mmcm_sweep_enable_o         (mmcm_sweep_enable),
+    .single_ended_select_o       (single_ended_select),
     .mmcm_reset_o                (mmcm_reset),
     .mmcm_ps_request_o           (mmcm_ps_request),
     .mmcm_ps_incdec_o            (mmcm_ps_incdec),

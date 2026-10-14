@@ -1,22 +1,78 @@
-# LVDS CARRY4 TDC integration and register map
+# CARRY4 TDC integration and register map
 
 This block is instantiated by `red_pitaya_top_LED7_mod.sv` for `Z20_G2` builds.
-It coexists with BNET in system-bus slot 7.
+It coexists with BNET and the GPIO pulse generator in system-bus slot 7.
+Current workspace setup, validation and next actions are in the
+[master handover](../../../../../RedPitaya_app/HANDOVER.md).
 
 ## Physical E3 allocation
 
-| Function | Top-level port | E3 signal | Zynq package pins |
-|---|---|---|---|
-| Launch output | `exp_e3p_o[0]`, `exp_e3n_o[0]` | DIO17 P/N | T5/U5 |
-| Delayed return input | `exp_e3p_i[0]`, `exp_e3n_i[0]` | DIO18 P/N | V11/V10 |
+| Function | Top-level port | E3 signal | E3 connector contacts P/N | Zynq package pins |
+|---|---|---|---|---|
+| Launch output to PCB | `exp_e3p_o[0]`, `exp_e3n_o[0]` | DIO17 P/N | **7 / 9** | T5/U5 |
+| Delayed return from PCB | `exp_e3p_i[0]`, `exp_e3n_i[0]` | DIO18 P/N | **31 / 33** | V11/V10 |
 
-Both pairs use `LVDS_25` in `red_pitaya_G2.xdc`. The TDC instantiation keeps
-`DIFF_TERM` disabled because the repository cannot establish whether the
-external receiver PCB already provides its 100-ohm termination. Enable internal
-termination only after the complete link has been checked electrically.
+Use E3 ground contact 16, 22 or 26 for the common reference. These connector
+contact numbers are distinct from FPGA package ball names. Pinout reference:
+[STEMlab 125-14 PRO Z7020 Gen 2 E3 table](https://redpitaya.readthedocs.io/en/latest/developerGuide/hardware/GEN2/125-14_Gen2_Z7020_Pro/top.html#e3-connector-qspi-emmc-power-control).
+Feed an LVDS-compatible differential signal into the return pair; do not
+connect a 3.3 V GPIO signal directly to this 2.5 V bank.
+
+Both pairs use `LVDS_25` in `red_pitaya_G2.xdc`. The user confirmed an LVDS
+return with no external termination, so the TDC instantiation and defaults now
+enable `DIFF_TERM` for the FPGA input's internal 100-ohm differential termination.
+If external receiver termination is added later, disable the internal one.
 
 E3 indices 3:1 remain attached to `red_pitaya_daisy` as one clock and two data
 lanes. Index 0 no longer belongs to that auxiliary serializer.
+
+For initial external single-shot operation, the TDC generates its own launch
+edge and measures the PCB's corresponding delayed return. An unrelated free
+running input is not a controlled launch-to-return delay test. Configure source
+selection with the TDC disabled. Use a new implementation and fresh timing
+reports after changes; the internal MMCM test does not validate the E3 link.
+
+## Selectable single-ended return (interface v4)
+
+`TDC:INPUT SINGLE` selects **DIO2_P, E1 contact 7, FPGA J18,
+`exp_p_io[2]`**, instead of the LVDS return. The user confirmed the PCB output
+is a **3.3 V digital signal**. Connect PCB ground to E1 contact 25 or 26.
+The existing board `sdc/red_pitaya.xdc` already assigns J18 / LVCMOS33;
+no additional pin XDC is needed. This pin is permanently input-only in the
+custom top, even if housekeeping GPIO direction registers request output.
+Do not attach a 100-ohm shunt terminator to this single-ended input.
+
+`TDC:INPUT LVDS` restores the E3 return pair. `TDC:INPUT?` reports `LVDS` or
+`SINGLE`. MMCM/internal test selection still overrides either external input,
+so turn both test sources OFF for PCB acquisition. The E3 launch pair and the
+launch-to-return measurement procedure are the same for both external inputs.
+Only one input is measured at a time, on a rising edge; the selected signal
+must return LOW before the next acquisition.
+
+Set ENABLE OFF and wait for STATUS bit 0 to clear, or use TDC:RESET to abort
+an unfinished acquisition, before changing input. A changed selection resets
+controller/results/FIFO/event counters, clears the histogram, and disables
+LUT correction. It preserves other control settings. Wait for histogram clear
+completion before collecting calibration data; reload a LUT and characterize
+the offset for the selected input path before calibrated measurements.
+Rewriting the same selection while disabled/idle has no reset side effects.
+Soft reset preserves the external selection; FPGA reset restores LVDS.
+
+Rebuild and load the FPGA image and rebuild/redeploy both the API and statically
+linked SCPI server. The new API rejects input selection on pre-v4 FPGA images.
+
+```text
+TDC:ENABLE OFF
+TDC:TEST:INTERNAL OFF
+TDC:MMCM:ENABLE OFF
+TDC:RESET
+TDC:INPUT SINGLE
+TDC:INPUT?
+TDC:MODE SINGLE
+TDC:ENABLE ON
+TDC:MEASURE?
+TDC:ENABLE OFF
+```
 
 ## Address allocation
 
@@ -26,6 +82,7 @@ The PS UIO map already exposes slot 7 as `0x40700000..0x407fffff`.
 |---|---:|---|
 | `0x40700000..0x4070ffff` | `0x00000` | Existing BNET registers |
 | `0x40710000..0x4071ffff` | `0x10000` | TDC registers |
+| `0x40720000..0x4072ffff` | `0x20000` | GPIO pulse-generator registers |
 | remaining slot-7 ranges | other | Acknowledged bus error |
 
 The Red Pitaya C API uses relative UIO offsets. BNET remains at `0x00700000`;
@@ -39,7 +96,7 @@ effect once even though the system-bus request remains asserted until `ack`.
 
 | Offset | Register | Access | Reset / description |
 |---:|---|---|---|
-| `0x00` | `ID_VERSION` | R | `0x54444303` (`TDC`, RTL interface v3 with internal self-test + MMCM phase sweep) |
+| `0x00` | `ID_VERSION` | R | `0x54444304` (`TDC`, v4: selectable external LVDS/single-ended input) |
 | `0x04` | `CONTROL` | R/W | Persistent and pulse control fields below |
 | `0x08` | `STATUS` | R | Live state and FIFO level fields below |
 | `0x0c` | `LAUNCH_PERIOD` | R/W | 125000 clocks (1 ms at 125 MHz); zero clamps to one |
@@ -75,6 +132,7 @@ effect once even though the system-bus request remains asserted until `ack`.
 | `0x84` | `MMCM_STATUS` | R | bit 0 `LOCKED`; bit 1 `PS_BUSY`; bit 2 `PS_TIMEOUT` |
 | `0x88` | `MMCM_COARSE_DELAY` | R/W | Extra whole `clk_i` cycles inserted before the commanded edge fires; 0 by default |
 | `0x8c` | `MMCM_PHASE_COUNT` | R | Signed accumulated dynamic phase-shift step count since the last clear/reset |
+| `0x90` | `INPUT_SELECT` | R/W | 0 = LVDS (reset); 1 = SINGLE (E1 DIO2_P). Writes require ENABLE=0, BUSY=0; other values are rejected. Persists through soft reset. |
 
 Unsupported or unaligned accesses are acknowledged with `err=1`.
 

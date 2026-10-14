@@ -1338,6 +1338,9 @@ logic [DWE-1: 0] exp_p_altd, exp_n_altd;
 // The selected IOBUF is driven directly by pulse_gen's ODDR, including normal
 // GPIO passthrough while unclaimed. No fabric mux may be added after ODDR Q.
 localparam integer PULSE_GPIO_INDEX = 1;
+// Dedicated 3.3 V PCB return input: DIO2_P, E1 pin 7, FPGA J18.
+// Permanently input-only so GPIO commands cannot drive against the PCB.
+localparam integer TDC_GPIO_INDEX = 2;
 logic pulse_pin_data, pulse_pin_dir;
 
 logic [8-1:0] led_hk;
@@ -1448,6 +1451,9 @@ for(GM = 0 ; GM < DWE ; GM = GM + 1) begin : gpios
   if (GM == PULSE_GPIO_INDEX) begin : pulse_pin
     IOBUF i_iobufp (.O(exp_p_in[GM]), .IO(exp_p_io[GM]),
                    .I(pulse_pin_data), .T(~pulse_pin_dir));
+  end else if (GM == TDC_GPIO_INDEX) begin : tdc_input_pin
+    IOBUF i_iobufp (.O(exp_p_in[GM]), .IO(exp_p_io[GM]),
+                   .I(1'b0), .T(1'b1));
   end else begin : normal_pin
     IOBUF i_iobufp (.O(exp_p_in[GM]), .IO(exp_p_io[GM]),
                    .I(exp_p_otr[GM]), .T(~exp_p_dtr[GM]));
@@ -1733,13 +1739,14 @@ red_pitaya_daisy  #(
 );
 
   // DIO17 (TX) and DIO18 (RX), E3 vector index zero, are reserved for the
-  // analogue-to-time measurement path.  External termination is expected for
-  // the first board revision, so the FPGA input termination remains disabled.
+  // analogue-to-time measurement path. The confirmed LVDS return has no
+  // external termination; enable the FPGA's internal differential terminator.
 tdc_top #(
   .NUM_CARRY4      (128),
   .FIFO_DEPTH      (256),
   .INVERT_TAPS     (1'b0),
-  .RETURN_DIFF_TERM(1'b0)
+  // The PCB returns LVDS with no external receiver termination.
+  .RETURN_DIFF_TERM(1'b1)
 ) i_tdc (
   .clk_i       (adc_clk),
   .rstn_i      (adc_rstn),
@@ -1749,6 +1756,7 @@ tdc_top #(
   .launch_n_o  (exp_e3n_o[0]),
   .return_p_i  (exp_e3p_i[0]),
   .return_n_i  (exp_e3n_i[0]),
+  .return_single_i (exp_p_in[TDC_GPIO_INDEX]),
   .sys_addr_i  (sys[7].addr),
   .sys_wdata_i (sys[7].wdata),
   .sys_wen_i   (tdc_sys_wen),

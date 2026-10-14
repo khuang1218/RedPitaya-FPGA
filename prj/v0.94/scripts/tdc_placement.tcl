@@ -18,7 +18,7 @@ proc tdc_get_carries {} {
 
 proc tdc_get_tap_ffs {} {
   return [lsort -dictionary [get_cells -quiet -hierarchical -filter {
-    REF_NAME == FDRE && NAME =~ *i_tdc/i_carry/gen_tap*/i_tap_ff
+    REF_NAME == FDRE && NAME =~ *i_tdc/i_carry/gen_tap*i_tap_ff
   }]]
 }
 
@@ -48,8 +48,8 @@ proc tdc_place_chain {slice_x first_slice_y} {
 
     for {set lane 0} {$lane < 4} {incr lane} {
       set tap_cell [lindex $tap_ffs [expr {$stage * 4 + $lane}]]
-      set_property LOC $site_name $tap_cell
       set_property BEL [lindex $bels $lane] $tap_cell
+      set_property LOC $site_name $tap_cell
     }
   }
 
@@ -81,8 +81,8 @@ proc tdc_write_placement_xdc {output_file slice_x first_slice_y} {
     for {set lane 0} {$lane < 4} {incr lane} {
       set tap_cell [lindex $tap_ffs [expr {$stage * 4 + $lane}]]
       set bel [lindex $bels $lane]
-      puts $handle "set_property LOC $site_name \[get_cells {$tap_cell}\]"
       puts $handle "set_property BEL $bel \[get_cells {$tap_cell}\]"
+      puts $handle "set_property LOC $site_name \[get_cells {$tap_cell}\]"
     }
   }
   close $handle

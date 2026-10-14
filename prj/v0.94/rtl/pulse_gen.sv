@@ -36,12 +36,20 @@ module pulse_gen #(
     else fast_reset_pipe <= {fast_reset_pipe[1:0], 1'b1};
   wire bus_rstn = bus_reset_pipe[2];
   wire fast_rstn = fast_reset_pipe[2];
+  // Give the ODDR reset its own final stage rather than routing the reset
+  // shared by the counter/mailbox to the IOB. Assertion still works without
+  // a running fast clock; release remains timed to that clock.
+  (* ASYNC_REG = "TRUE" *) logic oddr_rstn;
+  always_ff @(posedge fast_clk_i or negedge arstn_i)
+    if (!arstn_i) oddr_rstn <= 1'b0;
+    else oddr_rstn <= fast_rstn;
 
   logic [31:0] shadow_period, shadow_high;
   logic shadow_enable, claimed, error_sticky;
   // Bundled-data mailbox: immutable from request until returned ACK.
   // Only the toggles cross through synchronizers; the data stays stable.
   logic [31:0] mailbox_period, mailbox_high;
+  logic [31:0] mailbox_last, active_last;
   logic mailbox_enable, request_toggle, ack_toggle;
   (* ASYNC_REG = "TRUE" *) logic [1:0] ack_sync, request_sync;
   (* ASYNC_REG = "TRUE" *) logic [1:0] claim_sync, enable_sync, ready_sync;
@@ -79,6 +87,7 @@ module pulse_gen #(
       error_sticky <= 1'b0;
       mailbox_period <= DEFAULT_PERIOD;
       mailbox_high <= DEFAULT_HIGH;
+      mailbox_last <= DEFAULT_PERIOD - 32'd2;
       mailbox_enable <= 1'b0;
       request_toggle <= 1'b0;
       sys_rdata_o <= '0;
@@ -87,8 +96,10 @@ module pulse_gen #(
     end else begin
       sys_ack_o <= sys_wen_i | sys_ren_i;
       sys_err_o <= 1'b0;
-      sys_rdata_o <= '0;
       if (sys_wen_i || sys_ren_i) begin
+        // The system-bus CDC returns data to the PS after this local request
+        // deasserts. Hold the last response until another request arrives.
+        sys_rdata_o <= '0;
         case (sys_addr_i[15:0])
           16'h0000: begin
             sys_rdata_o <= ID_VERSION;
@@ -124,6 +135,7 @@ module pulse_gen #(
                 end else begin
                   mailbox_period <= shadow_period;
                   mailbox_high <= shadow_high;
+                  mailbox_last <= shadow_period - 32'd2;
                   mailbox_enable <= shadow_enable;
                   request_toggle <= ~request_toggle;
                   if (shadow_enable) claimed <= 1'b1;
@@ -139,6 +151,7 @@ module pulse_gen #(
                   shadow_enable <= 1'b0;
                   mailbox_period <= DEFAULT_PERIOD;
                   mailbox_high <= DEFAULT_HIGH;
+                  mailbox_last <= DEFAULT_PERIOD - 32'd2;
                   mailbox_enable <= 1'b0;
                   request_toggle <= ~request_toggle;
                   claimed <= 1'b0;
@@ -174,6 +187,7 @@ module pulse_gen #(
   logic [31:0] phase;
   logic [1:0] ddr_data;
   logic [1:0] claim_drive_delay;
+  (* ASYNC_REG = "TRUE" *) logic [1:0] gpio_data_sync;
   // phase is always even; the two bits represent successive 2 ns intervals.
   // Periods are even, so the pair never straddles a period boundary.
   always_ff @(posedge fast_clk_i or negedge fast_rstn) begin
@@ -184,16 +198,20 @@ module pulse_gen #(
       ack_toggle <= 1'b0;
       active_period <= DEFAULT_PERIOD;
       active_high <= DEFAULT_HIGH;
+      active_last <= DEFAULT_PERIOD - 32'd2;
       active_enable <= 1'b0;
       phase <= '0;
       ddr_data <= '0;
+      gpio_data_sync <= '0;
     end else begin
+      gpio_data_sync <= {gpio_data_sync[0], gpio_data_i};
       request_sync <= {request_sync[0], request_toggle};
       claim_sync <= {claim_sync[0], claimed};
       claim_drive_delay <= {claim_drive_delay[0], claim_sync[1]};
       if (request_sync[1] != ack_toggle) begin
         active_period <= mailbox_period;
         active_high <= mailbox_high;
+        active_last <= mailbox_last;
         active_enable <= mailbox_enable;
         ack_toggle <= request_sync[1];
         phase <= '0;
@@ -204,7 +222,9 @@ module pulse_gen #(
       end else if (active_enable && claim_sync[1] && claim_drive_delay[1]) begin
         ddr_data[0] <= phase < active_high;
         ddr_data[1] <= (phase + 32'd1) < active_high;
-        phase <= (phase == active_period - 32'd2) ? 32'd0 : phase + 32'd2;
+        // Terminal subtraction is done on the 125 MHz bus side, outside
+        // this 4 ns counter feedback path.
+        phase <= (phase == active_last) ? 32'd0 : phase + 32'd2;
       end else begin
         phase <= '0;
         ddr_data <= '0;
@@ -216,9 +236,9 @@ module pulse_gen #(
   // selected pin's IOBUF; a LUT mux after ODDR would prevent IOB placement.
   ODDR #(.DDR_CLK_EDGE("SAME_EDGE"), .INIT(1'b0), .SRTYPE("ASYNC")) i_oddr (
     .Q(pin_data_o), .C(fast_clk_i), .CE(1'b1),
-    .D1(claim_sync[1] ? ddr_data[0] : gpio_data_i),
-    .D2(claim_sync[1] ? ddr_data[1] : gpio_data_i),
-    .R(!fast_rstn), .S(1'b0)
+    .D1(claim_sync[1] ? ddr_data[0] : gpio_data_sync[1]),
+    .D2(claim_sync[1] ? ddr_data[1] : gpio_data_sync[1]),
+    .R(!oddr_rstn), .S(1'b0)
   );
   // Let ODDR load LOW for a full fast clock before claiming an input pin.
   // Otherwise a saved HIGH GPIO data bit could leak out during first ON.

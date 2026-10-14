@@ -66,7 +66,13 @@ module tb_pulse_gen;
   initial begin
     #19; arstn = 1; #48; idle();
     rd(0, value); if (value != 32'h50554c01) $fatal(1, "ID mismatch");
+    // The PS bus bridge returns registered data several clocks after the
+    // local request drops. Readback must survive that handoff.
+    repeat (4) @(posedge bus_clk); #0.01;
+    if (rdata !== 32'h50554c01) $fatal(1, "ID readback cleared before bus CDC returned it");
     rd(16'h0018, value); if (value != 2) $fatal(1, "Timing unit mismatch");
+    repeat (4) @(posedge bus_clk); #0.01;
+    if (rdata !== 32'd2) $fatal(1, "Tick readback cleared before bus CDC returned it");
     rd(16'h001c, value); if (value != 1) $fatal(1, "GPIO index mismatch");
     gpio_dir = 1; gpio_data = 1; #12;
     if (pin_data !== 1 || pin_dir !== 1) $fatal(1, "Normal GPIO passthrough failed");

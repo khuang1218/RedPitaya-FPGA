@@ -43,19 +43,18 @@ module bnet_axi_reader_ch #(
 
   logic start_cfg_d;
   logic start_toggle_cfg;
-  logic start_toggle_axi_meta;
-  logic start_toggle_axi;
+  (* ASYNC_REG = "TRUE" *) logic start_toggle_axi_meta;
+  (* ASYNC_REG = "TRUE" *) logic start_toggle_axi;
   logic start_toggle_axi_d;
   logic start_axi_pulse;
   logic start_cfg_pulse;
   logic soft_reset_cfg_d;
   logic soft_reset_toggle_cfg;
-  logic soft_reset_toggle_axi_meta;
-  logic soft_reset_toggle_axi;
+  (* ASYNC_REG = "TRUE" *) logic soft_reset_toggle_axi_meta;
+  (* ASYNC_REG = "TRUE" *) logic soft_reset_toggle_axi;
   logic soft_reset_toggle_axi_d;
   logic soft_reset_axi_pulse;
 
-  logic [32-1:0] length_bytes_axi;
   logic [32-1:0] rd_addr_axi;
   logic [32-1:0] bytes_requested_axi;
   logic          running_axi;
@@ -64,6 +63,9 @@ module bnet_axi_reader_ch #(
   logic [32-1:0] next_burst_bytes_axi;
   logic [5-1:0]  next_burst_beats_axi;
   logic          can_request_axi;
+  logic [4:0] planned_beats_axi;
+  logic [31:0] planned_bytes_axi;
+  logic planned_last_axi, plan_valid_axi;
 
   logic [32-1:0] ctrl_addr;
   logic [4-1:0]  ctrl_size;
@@ -114,7 +116,8 @@ module bnet_axi_reader_ch #(
   assign fifo_wr = skid_pop;
   assign fifo_din = skid_mem[skid_rd_ptr];
   assign fifo_rst_cfg = !cfg_rstn_i || soft_reset_i || start_cfg_pulse;
-  assign debug0_o = {11'd0,
+  logic [31:0] debug0_axi;
+  assign debug0_axi = {11'd0,
                      skid_overflow_axi,
                      skid_ready,
                      skid_count,
@@ -125,15 +128,60 @@ module bnet_axi_reader_ch #(
                      ctrl_val,
                      can_request_axi,
                      fifo_wr_rst_busy,
-                     fifo_rd_rst_busy,
+                     1'b0,
                      fifo_full,
-                     fifo_empty,
-                     fifo_rd_pending,
-                     word_valid,
-                     fifo_rd,
+                     1'b0,
+                     1'b0,
+                     1'b0,
+                     1'b0,
                      rd_dval,
-                     lane_index};
-  assign debug1_o = bytes_requested_axi;
+                     {LANE_W{1'b0}}};
+
+  // Coherent AXI-domain diagnostic snapshot. The previous live counter/flag
+  // bus crossed directly into the 125 MHz register mux and failed timing.
+  // A mailbox stays stable until its acknowledgement reaches the cfg side.
+  logic debug_request_cfg, debug_ack_axi;
+  (* ASYNC_REG = "TRUE" *) logic debug_request_meta, debug_request_sync;
+  (* ASYNC_REG = "TRUE" *) logic debug_ack_meta, debug_ack_sync;
+  logic [63:0] debug_mailbox_axi;
+  logic [31:0] debug0_snapshot;
+  always_ff @(posedge axi_sys.clk) begin
+    if (!axi_sys.rstn) begin
+      debug_request_meta <= 1'b0;
+      debug_request_sync <= 1'b0;
+      debug_ack_axi <= 1'b0;
+      debug_mailbox_axi <= '0;
+    end else begin
+      debug_request_meta <= debug_request_cfg;
+      debug_request_sync <= debug_request_meta;
+      if (debug_request_sync != debug_ack_axi) begin
+        debug_mailbox_axi <= {bytes_requested_axi, debug0_axi};
+        debug_ack_axi <= debug_request_sync;
+      end
+    end
+  end
+  always_ff @(posedge cfg_clk_i) begin
+    if (!cfg_rstn_i) begin
+      debug_ack_meta <= 1'b0;
+      debug_ack_sync <= 1'b0;
+      debug_request_cfg <= 1'b0;
+      debug0_snapshot <= '0;
+      debug1_o <= '0;
+    end else begin
+      debug_ack_meta <= debug_ack_axi;
+      debug_ack_sync <= debug_ack_meta;
+      if (debug_ack_sync == debug_request_cfg) begin
+        {debug1_o, debug0_snapshot} <= debug_mailbox_axi;
+        debug_request_cfg <= ~debug_request_cfg;
+      end
+    end
+  end
+  always_comb begin
+    debug0_o = debug0_snapshot;
+    debug0_o[8] = fifo_rd_rst_busy;
+    debug0_o[6:3] = {fifo_empty, fifo_rd_pending, word_valid, fifo_rd};
+    debug0_o[LANE_W-1:0] = lane_index;
+  end
 
   always_ff @(posedge cfg_clk_i) begin
     if (!cfg_rstn_i) begin
@@ -176,9 +224,6 @@ module bnet_axi_reader_ch #(
   assign fifo_rst_axi = !axi_sys.rstn || soft_reset_axi_pulse || start_axi_pulse;
 
   always_comb begin
-    remaining_bytes_axi = (bytes_requested_axi < length_bytes_axi) ?
-                          (length_bytes_axi - bytes_requested_axi) :
-                          32'd0;
     next_burst_beats_axi = AXI_BURST_BEATS;
 
     if (remaining_bytes_axi < (AXI_BURST_LEN * AXI_BYTE_W)) begin
@@ -190,8 +235,7 @@ module bnet_axi_reader_ch #(
 
     next_burst_bytes_axi = {27'd0, next_burst_beats_axi} * AXI_BYTE_W;
     can_request_axi = running_axi &&
-                      (remaining_bytes_axi != 32'd0) &&
-                      (next_burst_beats_axi != 5'd0) &&
+                      plan_valid_axi &&
                       !ctrl_req_inflight_axi &&
                       !ctrl_busy &&
                       !fifo_full &&
@@ -230,7 +274,11 @@ module bnet_axi_reader_ch #(
 
   always_ff @(posedge axi_sys.clk) begin
     if (!axi_sys.rstn || soft_reset_axi_pulse) begin
-      length_bytes_axi <= 32'd0;
+      remaining_bytes_axi <= 32'd0;
+      planned_beats_axi <= '0;
+      planned_bytes_axi <= '0;
+      planned_last_axi <= 1'b0;
+      plan_valid_axi <= 1'b0;
       rd_addr_axi <= 32'd0;
       bytes_requested_axi <= 32'd0;
       running_axi <= 1'b0;
@@ -243,7 +291,8 @@ module bnet_axi_reader_ch #(
       ctrl_val <= 1'b0;
 
       if (start_axi_pulse) begin
-        length_bytes_axi <= length_bytes_i;
+        remaining_bytes_axi <= length_bytes_i;
+        plan_valid_axi <= 1'b0;
         rd_addr_axi <= active_buf_i ? base1_i : base0_i;
         bytes_requested_axi <= 32'd0;
         running_axi <= enable_i && (length_bytes_i != 32'd0);
@@ -251,14 +300,16 @@ module bnet_axi_reader_ch #(
         ctrl_busy_seen_axi <= 1'b0;
       end else if (can_request_axi) begin
         ctrl_addr <= rd_addr_axi;
-        ctrl_size <= next_burst_beats_axi[3:0] - 1'b1;
+        ctrl_size <= planned_beats_axi[3:0] - 1'b1;
         ctrl_val <= 1'b1;
-        rd_addr_axi <= rd_addr_axi + next_burst_bytes_axi;
-        bytes_requested_axi <= bytes_requested_axi + next_burst_bytes_axi;
+        rd_addr_axi <= rd_addr_axi + planned_bytes_axi;
+        bytes_requested_axi <= bytes_requested_axi + planned_bytes_axi;
+        remaining_bytes_axi <= planned_last_axi ? 32'd0 : remaining_bytes_axi - planned_bytes_axi;
+        plan_valid_axi <= 1'b0;
         ctrl_req_inflight_axi <= 1'b1;
         ctrl_busy_seen_axi <= 1'b0;
 
-        if (next_burst_bytes_axi >= remaining_bytes_axi) begin
+        if (planned_last_axi) begin
           running_axi <= 1'b0;
         end
       end else if (ctrl_req_inflight_axi) begin
@@ -268,6 +319,15 @@ module bnet_axi_reader_ch #(
           ctrl_req_inflight_axi <= 1'b0;
           ctrl_busy_seen_axi <= 1'b0;
         end
+      end
+
+      // Separate burst sizing from the 250 MHz address/count feedback path.
+      // The plan can be prepared while the preceding AXI request completes.
+      if (!start_axi_pulse && running_axi && !plan_valid_axi) begin
+        planned_beats_axi <= next_burst_beats_axi;
+        planned_bytes_axi <= next_burst_bytes_axi;
+        planned_last_axi <= next_burst_bytes_axi >= remaining_bytes_axi;
+        plan_valid_axi <= 1'b1;
       end
     end
   end

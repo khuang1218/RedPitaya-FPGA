@@ -104,6 +104,6 @@ set_max_delay -datapath_only 8.000 -from [get_pins i_hk/i_freq_meter/ref_gate_re
 set_false_path -from [get_pins {adc_dat*[*][*]/C}] -to [get_pins {dac_dat_*[*]/D}]
 
 # constrain for clock capable line on E3, to preven loop test error
-create_clock -name e3_3i -period 4.000 [get_ports exp_e3*_i[3]]
+create_clock -name e3_3i -period 4.000 [get_ports {exp_e3p_i[3]}]
 
 set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]

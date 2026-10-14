@@ -3,7 +3,7 @@
 //
 // This block belongs only to the TDC self-test. It does not touch
 // red_pitaya_pll (the shared PLLE2_ADV that clocks the ADC/DAC/serial/PWM
-// paths) and must not be used to imply that PLL's phase c46an move.
+// paths) and must not be used to imply that PLL's phase can move.
 //
 // A dedicated MMCME2_ADV is fed from the same adc_clk reference used
 // elsewhere in the TDC (clk_i) and regenerates a same-frequency output
@@ -250,8 +250,8 @@ module tdc_mmcm_stimulus #(
   // trying to infer the correct coarse count from the captured (coarse,
   // fine) result after the fact -- the fine reading is identical whichever
   // way the crossing resolves, so it carries no information to disambiguate.
-  (* ASYNC_REG = "TRUE" *) logic toggle_meta, toggle_sync;
-  logic toggle_settled, toggle_settled_d;
+  (* ASYNC_REG = "TRUE" *) logic toggle_meta, toggle_sync, toggle_settled;
+  logic toggle_settled_d;
   logic [$clog2(STRETCH_CYCLES+1)-1:0] stretch_counter;
   logic event_reg;
 
