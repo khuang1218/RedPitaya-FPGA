@@ -402,6 +402,23 @@ logic [2-1:0]            digital_loop;
 sys_bus_if   ps_sys      (.clk (fclk[0]), .rstn (frstn[0]));
 sys_bus_if   sys [8-1:0] (.clk (adc_clk), .rstn (adc_rstn));
 
+// sys[7] is shared by BNET (offset 0x00000) and the TDC (offset 0x10000).
+// Keep the local slave signals explicit so both blocks can coexist without
+// changing any existing BNET register address.
+logic [31:0] bnet_sys_rdata;
+logic        bnet_sys_err;
+logic        bnet_sys_ack;
+logic        bnet_sys_wen;
+logic        bnet_sys_ren;
+logic [31:0] tdc_sys_rdata;
+logic        tdc_sys_err;
+logic        tdc_sys_ack;
+logic        tdc_sys_wen;
+logic        tdc_sys_ren;
+logic        sys7_bnet_sel;
+logic        sys7_tdc_sel;
+logic        sys7_request;
+
 // GPIO interface to the PS. Width is 3*GDW because it carries multiple GPIO
 // groups, not just one physical connector bank.
 gpio_if #(.DW (3*GDW)) gpio ();
@@ -1657,14 +1674,14 @@ red_pitaya_daisy i_daisy (
   // exp_e3x_i={DIO12, DIO14, DIO16, DIO18}
 red_pitaya_daisy  #(
   .IO_STD("LVDS_25"),
-  .N_DATS(3)
+  .N_DATS(2)
 ) i_serlines_add
 (
    // SATA connector
-  .daisy_p_o       (  exp_e3p_o                  ),  // line 3 is clock capable (SRCC)
-  .daisy_n_o       (  exp_e3n_o                  ),
-  .daisy_p_i       (  exp_e3p_i                  ),  // line 3 is clock capable (MRCC)
-  .daisy_n_i       (  exp_e3n_i                  ),
+  .daisy_p_o       (  exp_e3p_o[3:1]             ),  // DIO11 clock, DIO13/DIO15 data
+  .daisy_n_o       (  exp_e3n_o[3:1]             ),
+  .daisy_p_i       (  exp_e3p_i[3:1]             ),  // DIO12 clock, DIO14/DIO16 data
+  .daisy_n_i       (  exp_e3n_i[3:1]             ),
    // Data
   .ser_clk_i       (  ser_clk                    ),  // high speed serial
   .dly_clk_i       (  dly_clk                    ),  // delay clock
@@ -1694,12 +1711,61 @@ red_pitaya_daisy  #(
   .sys_err_o       (  sys[6].err                 ),
   .sys_ack_o       (  sys[6].ack                 )
 );
+
+  // DIO17 (TX) and DIO18 (RX), E3 vector index zero, are reserved for the
+  // analogue-to-time measurement path.  External termination is expected for
+  // the first board revision, so the FPGA input termination remains disabled.
+tdc_top #(
+  .NUM_CARRY4      (128),
+  .FIFO_DEPTH      (256),
+  .INVERT_TAPS     (1'b0),
+  .RETURN_DIFF_TERM(1'b0)
+) i_tdc (
+  .clk_i       (adc_clk),
+  .rstn_i      (adc_rstn),
+  .test_clk_i  (fclk[0]),
+  .test_rstn_i (frstn[0]),
+  .launch_p_o  (exp_e3p_o[0]),
+  .launch_n_o  (exp_e3n_o[0]),
+  .return_p_i  (exp_e3p_i[0]),
+  .return_n_i  (exp_e3n_i[0]),
+  .sys_addr_i  (sys[7].addr),
+  .sys_wdata_i (sys[7].wdata),
+  .sys_wen_i   (tdc_sys_wen),
+  .sys_ren_i   (tdc_sys_ren),
+  .sys_rdata_o (tdc_sys_rdata),
+  .sys_err_o   (tdc_sys_err),
+  .sys_ack_o   (tdc_sys_ack)
+);
   `else
   // If the optional E3 connector is not present, sys[6] is still connected to a
   // stub so reads/writes to that address range complete cleanly instead of
   // hanging the bus.
   sys_bus_stub sys_bus_stub_6 (sys[6]);
   `endif
+
+  // Local decode inside the existing 1 MiB sys[7] window:
+  //   0x4070_0000..0x4070_ffff -> BNET
+  //   0x4071_0000..0x4071_ffff -> TDC (Z20_G2 only)
+  // All other offsets acknowledge with an error so an unsupported access can
+  // never leave the GP0/system bus transaction stuck.
+  assign sys7_request  = sys[7].wen | sys[7].ren;
+  assign sys7_bnet_sel = (sys[7].addr[19:16] == 4'h0);
+`ifdef Z20_G2
+  assign sys7_tdc_sel  = (sys[7].addr[19:16] == 4'h1);
+`else
+  assign sys7_tdc_sel  = 1'b0;
+`endif
+  assign bnet_sys_wen  = sys[7].wen & sys7_bnet_sel;
+  assign bnet_sys_ren  = sys[7].ren & sys7_bnet_sel;
+  assign tdc_sys_wen   = sys[7].wen & sys7_tdc_sel;
+  assign tdc_sys_ren   = sys[7].ren & sys7_tdc_sel;
+  assign sys[7].rdata  = sys7_tdc_sel  ? tdc_sys_rdata :
+                         sys7_bnet_sel ? bnet_sys_rdata : 32'd0;
+  assign sys[7].ack    = sys7_tdc_sel  ? tdc_sys_ack :
+                         sys7_bnet_sel ? bnet_sys_ack : sys7_request;
+  assign sys[7].err    = sys7_tdc_sel  ? tdc_sys_err :
+                         sys7_bnet_sel ? bnet_sys_err : sys7_request;
 
   // sys[7] is the custom butterfly-network scalar register block. With SW=20
   // in the interconnect above, this occupies the 0x0070_0000 FPGA bus region
@@ -1711,11 +1777,11 @@ red_pitaya_daisy  #(
     .rstn_i         (adc_rstn        ),
     .sys_addr_i     (sys[7].addr     ),
     .sys_wdata_i    (sys[7].wdata    ),
-    .sys_wen_i      (sys[7].wen      ),
-    .sys_ren_i      (sys[7].ren      ),
-    .sys_rdata_o    (sys[7].rdata    ),
-    .sys_err_o      (sys[7].err      ),
-    .sys_ack_o      (sys[7].ack      ),
+    .sys_wen_i      (bnet_sys_wen    ),
+    .sys_ren_i      (bnet_sys_ren    ),
+    .sys_rdata_o    (bnet_sys_rdata  ),
+    .sys_err_o      (bnet_sys_err    ),
+    .sys_ack_o      (bnet_sys_ack    ),
     .led_debug_o    (bnet_led_debug  ),
     .led_debug_en_o (bnet_led_debug_en),
     .led6_heartbeat_en_o (bnet_led6_heartbeat_en),

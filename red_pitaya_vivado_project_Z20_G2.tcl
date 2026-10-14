@@ -96,6 +96,7 @@ upgrade_ip [get_ips *]
 
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya.xdc
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya_G2.xdc
+add_files -fileset constrs_1      $path_sdc_prj/tdc_Z20_G2.xdc
 
 ################################################################################
 # start gui
