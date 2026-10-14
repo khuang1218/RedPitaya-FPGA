@@ -116,7 +116,9 @@ module pulse_gen #(
             case (sys_wdata_i)
               32'd1: begin
                 if (busy || !ready_sync[1] || !valid_timing ||
-                    (enable_sync[1] && shadow_enable)) begin
+                    // The last accepted command is authoritative while idle;
+                    // synchronized status can settle a cycle after the ACK.
+                    (mailbox_enable && shadow_enable)) begin
                   error_sticky <= 1'b1;
                   sys_err_o <= 1'b1;
                 end else begin
@@ -196,7 +198,10 @@ module pulse_gen #(
         ack_toggle <= request_sync[1];
         phase <= '0;
         ddr_data <= '0;
-      end else if (active_enable) begin
+      // Request and ownership use separate synchronizers and can settle on
+      // different cycles. Keep phase at zero and ODDR data LOW until the
+      // driver guard is complete, so the first physical pulse is a full one.
+      end else if (active_enable && claim_sync[1] && claim_drive_delay[1]) begin
         ddr_data[0] <= phase < active_high;
         ddr_data[1] <= (phase + 32'd1) < active_high;
         phase <= (phase == active_period - 32'd2) ? 32'd0 : phase + 32'd2;

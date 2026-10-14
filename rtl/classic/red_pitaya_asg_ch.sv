@@ -107,8 +107,8 @@ wire [14-1:0] lfsr_noise;
 
 localparam PNT_SIZE = RSZ+16+32;
 typedef enum logic [0:0] {
-    RDLY_MODE_CONST  = 2'b00,
-    RDLY_MODE_COPY  = 2'b01
+    RDLY_MODE_CONST  = 1'b0,
+    RDLY_MODE_COPY  = 1'b1
 } rdly_mode_t;
 
 reg   [  14-1: 0] dac_buf [0:(1<<RSZ)-1] ;
@@ -145,6 +145,9 @@ reg   [   5-1: 0] zero_sr;
 
 wire              not_burst;
 wire  [   5-1: 0] out_sel;
+reg               init_run;
+wire              do_read;
+wire              do_read_end;
 
 assign not_burst = (&(~set_ncyc_i)) && (&(~set_rnum_i));
 
@@ -205,7 +208,6 @@ wire             ext_trig_n   ;
 reg  [  16-1: 0] rep_cnt      ;
 reg  [  32-1: 0] dly_cnt      ;
 reg  [   8-1: 0] dly_tick     ;
-reg              init_run     ;
 
 reg  [  32-1: 0] set_step      ;  
 reg  [  32-1: 0] set_step_lo      ;  
@@ -215,9 +217,7 @@ reg              dac_rep      ;
 wire             dac_trig     ;
 reg              dac_trigr    ;
 
-wire             do_read      ;
 wire             do_read_start;
-wire             do_read_end  ;
 wire             buf_cycle    ;
 
 assign do_read       = set_axi_en_i ? axi_dac_do  : dac_do;

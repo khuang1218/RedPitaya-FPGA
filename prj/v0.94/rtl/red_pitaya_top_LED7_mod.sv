@@ -402,7 +402,7 @@ logic [2-1:0]            digital_loop;
 sys_bus_if   ps_sys      (.clk (fclk[0]), .rstn (frstn[0]));
 sys_bus_if   sys [8-1:0] (.clk (adc_clk), .rstn (adc_rstn));
 
-// sys[7] is shared by BNET (offset 0x00000) and the TDC (offset 0x10000).
+// sys[7] is shared by BNET (0x00000), TDC (0x10000), and pulse (0x20000).
 // Keep the local slave signals explicit so both blocks can coexist without
 // changing any existing BNET register address.
 logic [31:0] bnet_sys_rdata;
@@ -415,9 +415,16 @@ logic        tdc_sys_err;
 logic        tdc_sys_ack;
 logic        tdc_sys_wen;
 logic        tdc_sys_ren;
+logic [31:0] pulse_sys_rdata;
+logic        pulse_sys_err;
+logic        pulse_sys_ack;
+logic        pulse_sys_wen;
+logic        pulse_sys_ren;
 logic        sys7_bnet_sel;
 logic        sys7_tdc_sel;
+logic        sys7_pulse_sel;
 logic        sys7_request;
+logic        sys7_invalid_ack;
 
 // GPIO interface to the PS. Width is 3*GDW because it carries multiple GPIO
 // groups, not just one physical connector bank.
@@ -1755,11 +1762,61 @@ tdc_top #(
   // stub so reads/writes to that address range complete cleanly instead of
   // hanging the bus.
   sys_bus_stub sys_bus_stub_6 (sys[6]);
+  assign tdc_sys_rdata = 32'd0;
+  assign tdc_sys_err = 1'b0;
+  assign tdc_sys_ack = 1'b0;
   `endif
 
-  // sys[7] is the custom butterfly-network scalar register block. With SW=20
-  // in the interconnect above, this occupies the 0x0070_0000 FPGA bus region
-  // relative to the /dev/uio/api map used by Red Pitaya software.
+  // Decode the local 64 KiB regions independently for reads and writes.
+  assign sys7_bnet_sel = sys[7].addr[19:16] == 4'h0;
+  `ifdef Z20_G2
+  assign sys7_tdc_sel = sys[7].addr[19:16] == 4'h1;
+  `else
+  assign sys7_tdc_sel = 1'b0;
+  `endif
+  assign sys7_pulse_sel = sys[7].addr[19:16] == 4'h2;
+  assign sys7_request = sys[7].wen | sys[7].ren;
+  assign bnet_sys_wen = sys[7].wen && sys7_bnet_sel;
+  assign bnet_sys_ren = sys[7].ren && sys7_bnet_sel;
+  assign tdc_sys_wen = sys[7].wen && sys7_tdc_sel;
+  assign tdc_sys_ren = sys[7].ren && sys7_tdc_sel;
+  assign pulse_sys_wen = sys[7].wen && sys7_pulse_sel;
+  assign pulse_sys_ren = sys[7].ren && sys7_pulse_sel;
+
+  // Unknown regions complete with a registered bus error.
+  always_ff @(posedge adc_clk) begin
+    if (!adc_rstn) sys7_invalid_ack <= 1'b0;
+    else sys7_invalid_ack <= sys7_request &&
+                            !(sys7_bnet_sel || sys7_tdc_sel || sys7_pulse_sel);
+  end
+  assign sys[7].rdata = sys7_bnet_sel ? bnet_sys_rdata :
+                        sys7_tdc_sel ? tdc_sys_rdata :
+                        sys7_pulse_sel ? pulse_sys_rdata : 32'd0;
+  assign sys[7].err = sys7_bnet_sel ? bnet_sys_err :
+                      sys7_tdc_sel ? tdc_sys_err :
+                      sys7_pulse_sel ? pulse_sys_err : sys7_invalid_ack;
+  assign sys[7].ack = sys7_bnet_sel ? bnet_sys_ack :
+                      sys7_tdc_sel ? tdc_sys_ack :
+                      sys7_pulse_sel ? pulse_sys_ack : sys7_invalid_ack;
+
+  pulse_gen #(.GPIO_INDEX(PULSE_GPIO_INDEX)) i_pulse_gen (
+    .bus_clk_i   (adc_clk),
+    .fast_clk_i  (ser_clk),
+    .arstn_i     (adc_rstn),
+    .sys_addr_i  (sys[7].addr),
+    .sys_wdata_i (sys[7].wdata),
+    .sys_wen_i   (pulse_sys_wen),
+    .sys_ren_i   (pulse_sys_ren),
+    .sys_rdata_o (pulse_sys_rdata),
+    .sys_err_o   (pulse_sys_err),
+    .sys_ack_o   (pulse_sys_ack),
+    .gpio_data_i (exp_p_otr[PULSE_GPIO_INDEX]),
+    .gpio_dir_i  (exp_p_dtr[PULSE_GPIO_INDEX]),
+    .pin_data_o  (pulse_pin_data),
+    .pin_dir_o   (pulse_pin_dir)
+  );
+
+  // BNET retains its full address and all existing register offsets.
   bnet_regs #(
     .STREAM_COUNT (BNET_STREAM_COUNT)
   ) i_bnet_regs (
@@ -1767,11 +1824,11 @@ tdc_top #(
     .rstn_i         (adc_rstn        ),
     .sys_addr_i     (sys[7].addr     ),
     .sys_wdata_i    (sys[7].wdata    ),
-    .sys_wen_i      (sys[7].wen      ),
-    .sys_ren_i      (sys[7].ren      ),
-    .sys_rdata_o    (sys[7].rdata    ),
-    .sys_err_o      (sys[7].err      ),
-    .sys_ack_o      (sys[7].ack      ),
+    .sys_wen_i      (bnet_sys_wen    ),
+    .sys_ren_i      (bnet_sys_ren    ),
+    .sys_rdata_o    (bnet_sys_rdata  ),
+    .sys_err_o      (bnet_sys_err    ),
+    .sys_ack_o      (bnet_sys_ack    ),
     .led_debug_o    (bnet_led_debug  ),
     .led_debug_en_o (bnet_led_debug_en),
     .led6_heartbeat_en_o (bnet_led6_heartbeat_en),
@@ -1946,10 +2003,10 @@ assign adc_cdcs_o = 1'b1 ;
 assign dac_pwm_o  = 1'b0;
 
 // Stub unused bus regions so software accesses do not stall. This loop creates
-// stubs for sys[2] through sys[6]; sys[0]/sys[1] are the only meaningful regions
+// stubs for sys[2] through sys[7]; sys[0]/sys[1] are the only meaningful regions
 // in this reduced build.
 generate
-for (genvar i=2; i<7; i++) begin: for_sys2
+for (genvar i=2; i<8; i++) begin: for_sys2
   sys_bus_stub sys_bus_stub_2_5 (sys[i]);
 end: for_sys2
 endgenerate

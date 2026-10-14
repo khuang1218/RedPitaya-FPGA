@@ -82,6 +82,27 @@ module tb_pulse_gen;
       end
       begin start(8, 4); waveform(8, 4, 20); stop(); end
     join
+    // The independent claim synchronizer can settle later than the request
+    // synchronizer. Emulate that CDC skew: no waveform may start before the
+    // pin has first been enabled LOW, even with a long initial HIGH interval.
+    wr(16'h0014, 2); idle();
+    gpio_dir = 0; gpio_data = 1;
+    force dut.claim_sync = 2'b00;
+    wr(16'h000c, 500); wr(16'h0010, 250);
+    wr(16'h0004, 1); wr(16'h0014, 1);
+    wait (dut.active_enable === 1'b1);
+    repeat (4) @(negedge fast_clk);
+    if (pin_dir !== 0) $fatal(1, "Driver claimed before claim synchronization");
+    fork
+      begin
+        @(posedge pin_dir); #0.01;
+        if (pin_data !== 0) $fatal(1, "Claim/request CDC skew bypassed LOW startup guard");
+      end
+      begin
+        release dut.claim_sync;
+        idle(); waveform(1000, 500, 3); stop();
+      end
+    join
     gpio_dir = 1; gpio_data = 0;
     start(4, 2); waveform(4, 2, 20); stop();
     start(8, 2); waveform(8, 2, 20); stop();
@@ -90,7 +111,11 @@ module tb_pulse_gen;
     start(1000, 250); waveform(1000, 250, 10);
 
     // Live timing updates are rejected and leave the running waveform intact.
-    wr(16'h000c, 8); wr(16'h0010, 4); wr(16'h0014, 1, 1);
+    wr(16'h000c, 8); wr(16'h0010, 4);
+    // A lagging ENABLE status synchronizer must not authorize a live update.
+    force dut.enable_sync = 2'b00;
+    wr(16'h0014, 1, 1);
+    release dut.enable_sync;
     waveform(1000, 250, 3);
     rd(16'h0020, value); if (value != 500) $fatal(1, "Rejected update changed active period");
     wr(16'h0014, 4); stop();

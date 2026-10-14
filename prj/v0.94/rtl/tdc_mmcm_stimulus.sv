@@ -54,6 +54,8 @@ module tdc_mmcm_stimulus #(
   logic mmcm_locked_raw;
   logic psdone_raw;
   logic mmcm_rst;
+  logic psen_r;
+  logic psincdec_r;
 
   logic [3:0] mmcm_rst_stretch;
 
@@ -140,8 +142,6 @@ module tdc_mmcm_stimulus #(
   // --- Dynamic phase-shift controller, entirely on clk_i (== PSCLK) -------
   typedef enum logic [1:0] {PS_IDLE, PS_ASSERT, PS_WAIT} ps_state_t;
   ps_state_t ps_state;
-  logic psen_r;
-  logic psincdec_r;
   logic [$clog2(PS_TIMEOUT_CYCLES+1)-1:0] ps_timeout_counter;
 
   always_ff @(posedge clk_i) begin

@@ -123,6 +123,17 @@ synth_ip [get_ips sync_fifo]
 # synth_ip [get_ips *]
 #
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya_G2.xdc
+if {$prj_name == "v0.94" && [lsearch -regexp $prj_defs {^SCOPE_ONLY(=|$)}] < 0} {
+  add_files -fileset constrs_1 $path_sdc_prj/tdc_Z20_G2.xdc
+  add_files -fileset constrs_1 $path_sdc_prj/pulse_gen_Z20_G2.xdc
+  set_property used_in_synthesis false [get_files *pulse_gen_Z20_G2.xdc]
+  set_property used_in_implementation true [get_files *pulse_gen_Z20_G2.xdc]
+  if {[file exists $path_sdc_prj/tdc_placement_selected.xdc]} {
+    add_files -fileset constrs_1 $path_sdc_prj/tdc_placement_selected.xdc
+    set_property used_in_synthesis false [get_files *tdc_placement_selected.xdc]
+    set_property used_in_implementation true [get_files *tdc_placement_selected.xdc]
+  }
+}
 
 ################################################################################
 # ser parameter containing Git hash
