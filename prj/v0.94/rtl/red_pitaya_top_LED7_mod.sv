@@ -1342,6 +1342,8 @@ localparam integer PULSE_GPIO_INDEX = 1;
 // Permanently input-only so GPIO commands cannot drive against the PCB.
 localparam integer TDC_GPIO_INDEX = 2;
 logic pulse_pin_data, pulse_pin_dir;
+logic pulse_cycle_start;
+logic [31:0] pulse_active_period;
 
 logic [8-1:0] led_hk;
 logic [26-1:0] fpga_marker_cnt;
@@ -1752,6 +1754,9 @@ tdc_top #(
   .rstn_i      (adc_rstn),
   .test_clk_i  (fclk[0]),
   .test_rstn_i (frstn[0]),
+  .fast_clk_i  (ser_clk),
+  .pulse_cycle_start_i (pulse_cycle_start),
+  .pulse_period_i (pulse_active_period),
   .launch_p_o  (exp_e3p_o[0]),
   .launch_n_o  (exp_e3n_o[0]),
   .return_p_i  (exp_e3p_i[0]),
@@ -1821,7 +1826,9 @@ tdc_top #(
     .gpio_data_i (exp_p_otr[PULSE_GPIO_INDEX]),
     .gpio_dir_i  (exp_p_dtr[PULSE_GPIO_INDEX]),
     .pin_data_o  (pulse_pin_data),
-    .pin_dir_o   (pulse_pin_dir)
+    .pin_dir_o   (pulse_pin_dir),
+    .cycle_start_o (pulse_cycle_start),
+    .active_period_o (pulse_active_period)
   );
 
   // BNET retains its full address and all existing register offsets.

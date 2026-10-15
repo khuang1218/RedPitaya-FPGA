@@ -10,6 +10,7 @@ module tdc_registers #(
 )(
   input  logic                    clk_i,
   input  logic                    rstn_i,
+  input  logic                    acquisition_lock_i,
   input  logic [31:0]             sys_addr_i,
   input  logic [31:0]             sys_wdata_i,
   input  logic                    sys_wen_i,
@@ -78,7 +79,7 @@ module tdc_registers #(
   input  logic                    calibration_complete_i
 );
 
-  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_4304; // "TDC", v4: selectable external input
+  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_4306; // "TDC", v6: compact 16384-width bursts
 
   localparam logic [15:0] REG_ID_VERSION       = 16'h0000;
   localparam logic [15:0] REG_CONTROL          = 16'h0004;
@@ -173,7 +174,8 @@ module tdc_registers #(
 
     valid_write = 1'b1;
     case (register_offset)
-      REG_CONTROL, REG_LAUNCH_PERIOD, REG_LAUNCH_WIDTH,
+      REG_CONTROL: valid_write = !acquisition_lock_i || sys_wdata_i==0;
+      REG_LAUNCH_PERIOD, REG_LAUNCH_WIDTH,
       REG_TIMEOUT_CYCLES, REG_CLOCK_PERIOD_PS, REG_FIFO_CONTROL,
       REG_CAL_ADDR, REG_CAL_DATA, REG_CAL_CONTROL, REG_HIST_ADDR,
       REG_RAW_WORD_ADDR, REG_IRQ_MASK, REG_IRQ_STATUS:

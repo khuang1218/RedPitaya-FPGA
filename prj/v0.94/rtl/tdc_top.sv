@@ -16,6 +16,9 @@ module tdc_top #(
   input  logic                rstn_i,
   input  logic                test_clk_i,
   input  logic                test_rstn_i,
+  input  logic                fast_clk_i,
+  input  logic                pulse_cycle_start_i,
+  input  logic [31:0]         pulse_period_i,
 
   output logic                launch_p_o,
   output logic                launch_n_o,
@@ -89,6 +92,23 @@ module tdc_top #(
   logic [31:0] calibration_target;
   logic calibration_complete;
   logic core_rstn;
+  logic width_busy, width_select;
+  logic [31:0] legacy_rdata, width_rdata;
+  logic legacy_ack, legacy_err, width_ack, width_err;
+  assign width_select=sys_addr_i[15:8]==8'h01;
+  assign sys_rdata_o=width_select ? width_rdata : legacy_rdata;
+  assign sys_ack_o=width_select ? width_ack : legacy_ack;
+  assign sys_err_o=width_select ? width_err : legacy_err;
+
+  tdc_pulse_width #(.NUM_CARRY4(NUM_CARRY4),.NUM_TAPS(NUM_TAPS),.INDEX_W(INDEX_W)) i_width (
+    .bus_clk_i(clk_i),.fast_clk_i(fast_clk_i),.rstn_i(rstn_i),
+    .event_i(single_ended_select ? return_single_i : return_event),
+    .cycle_start_i(pulse_cycle_start_i),.pulse_period_i(pulse_period_i),
+    .input_select_i(single_ended_select),
+    .legacy_conflict_i(enable || internal_test_enable || mmcm_sweep_enable || state!=ST_IDLE),
+    .busy_o(width_busy),.sys_addr_i(sys_addr_i),.sys_wdata_i(sys_wdata_i),
+    .sys_wen_i(sys_wen_i && width_select),.sys_ren_i(sys_ren_i && width_select),
+    .sys_rdata_o(width_rdata),.sys_ack_o(width_ack),.sys_err_o(width_err));
 
   logic [31:0] coarse_counter;
   logic [31:0] launch_counter;
@@ -184,7 +204,7 @@ module tdc_top #(
   tdc_lvds_io #(
     .RETURN_DIFF_TERM(RETURN_DIFF_TERM)
   ) i_lvds (
-    .launch_i       (launch_internal),
+    .launch_i       (launch_internal && !width_busy),
     .launch_p_o     (launch_p_o),
     .launch_n_o     (launch_n_o),
     .return_p_i     (return_p_i),
@@ -266,13 +286,14 @@ module tdc_top #(
   ) i_registers (
     .clk_i                       (clk_i),
     .rstn_i                      (rstn_i),
+    .acquisition_lock_i          (width_busy),
     .sys_addr_i                  (sys_addr_i),
     .sys_wdata_i                 (sys_wdata_i),
-    .sys_wen_i                   (sys_wen_i),
-    .sys_ren_i                   (sys_ren_i),
-    .sys_rdata_o                 (sys_rdata_o),
-    .sys_err_o                   (sys_err_o),
-    .sys_ack_o                   (sys_ack_o),
+    .sys_wen_i                   (sys_wen_i && !width_select),
+    .sys_ren_i                   (sys_ren_i && !width_select),
+    .sys_rdata_o                 (legacy_rdata),
+    .sys_err_o                   (legacy_err),
+    .sys_ack_o                   (legacy_ack),
     .enable_o                    (enable),
     .continuous_o                (continuous),
     .raw_capture_enable_o        (raw_capture_enable),
@@ -300,7 +321,7 @@ module tdc_top #(
     .timeout_cycles_o            (timeout_cycles),
     .clock_period_ps_o           (clock_period_ps),
     .calibration_target_o        (calibration_target),
-    .busy_i                      (state != ST_IDLE),
+    .busy_i                      (state != ST_IDLE || width_busy),
     .last_coarse_i               (last_coarse),
     .last_fine_raw_i             (last_fine_raw),
     .last_fine_ps_i              (last_fine_ps),

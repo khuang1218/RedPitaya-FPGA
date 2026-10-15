@@ -1,8 +1,15 @@
 `timescale 1ns/1ps
 module tb_tdc_top;
-  reg clk=0,test_clk=0,rstn=0,wen=0,ren=0;
+  reg clk=0,test_clk=0,fast_clk=0,rstn=0,wen=0,ren=0;
   always #4 clk=~clk;
   always #3 test_clk=~test_clk;
+  always #2 fast_clk=~fast_clk;
+  reg width_run=0,width_marker=0;
+  integer width_phase=0;
+  always @(negedge fast_clk) begin
+    width_marker=width_run && width_phase==0;
+    width_phase=width_run ? ((width_phase==249) ? 0 : width_phase+1) : 0;
+  end
   reg [31:0] addr=0,wdata=0;
   wire [31:0] rdata;
   wire ack,err,launch_p,launch_n;
@@ -11,12 +18,16 @@ module tb_tdc_top;
   integer launches=0;
   tdc_top #(.NUM_CARRY4(4)) dut(
     .clk_i(clk),.rstn_i(rstn),.test_clk_i(test_clk),.test_rstn_i(rstn),
+    .fast_clk_i(fast_clk),.pulse_cycle_start_i(width_marker),.pulse_period_i(32'd500),
     .launch_p_o(launch_p),.launch_n_o(launch_n),
     .return_p_i(return_p),.return_n_i(~return_p),
     .return_single_i(return_single),
     .sys_addr_i(addr),.sys_wdata_i(wdata),.sys_wen_i(wen),.sys_ren_i(ren),
     .sys_rdata_o(rdata),.sys_ack_o(ack),.sys_err_o(err)
   );
+  always @(posedge fast_clk) if(width_marker) begin
+    #11;return_single=1;#102;return_single=0;
+  end
   always @(posedge launch_p) if(rstn) begin
     launches=launches+1;
     if(respond) begin
@@ -77,7 +88,7 @@ module tb_tdc_top;
     // Exercise an input transition after the UNISIM buffer initializes.
     #1; return_p=1; #1; return_p=0;
     #118; rstn=1; repeat(8) @(negedge clk);
-    rd(0,value); if(value!==32'h54444304) $fatal(1,"ID mismatch");
+    rd(0,value); if(value!==32'h54444306) $fatal(1,"ID mismatch");
     rd(16'h90,value); if(value!=0) $fatal(1,"Default source is not LVDS");
     reject_input(2);
     rd(16'h18,value); if(value!=16) $fatal(1,"Tap count mismatch");
@@ -137,6 +148,20 @@ module tb_tdc_top;
     return_single=1; respond_single=0;
     wr(16'h04,3); get_record(0,2);
     wr(16'h04,0);
+    repeat(12) @(negedge clk);
+    return_single=0;wr(16'h90,1);
+    rd(16'h100,value);if(value!=32'h50574201) $fatal(1,"Width register page not routed");
+    wr(16'h10c,2);wr(16'h104,1);
+    reject_input(0); // Source must be locked for the complete width transaction.
+    previous_launches=launches;width_run=1;
+    value=1;
+    while(value[0]) rd(16'h108,value);
+    width_run=0;
+    if(launches!=previous_launches) $fatal(1,"Width capture emitted an E3 launch");
+    rd(16'h114,value);if(value!=2) $fatal(1,"Width burst count");
+    wr(16'h118,0);rd(16'h120,value);
+    if(!value[0] || !value[8]) $fatal(1,"Width result flags");
+    rd(16'h134,value);if(value<98000 || value>106000) $fatal(1,"Width measured rising-edge latency instead of HIGH time: %d",value);
     $display("tb_tdc_top: PASS (LVDS/SINGLE isolation, idle guards, reset/FIFO/LUT; ideal taps)"); $finish;
   end
   initial begin #50000; $fatal(1,"Watchdog"); end

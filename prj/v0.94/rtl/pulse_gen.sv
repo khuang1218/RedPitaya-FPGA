@@ -19,7 +19,9 @@ module pulse_gen #(
   input  logic        gpio_data_i,
   input  logic        gpio_dir_i,
   output logic        pin_data_o,
-  output logic        pin_dir_o
+  output logic        pin_dir_o,
+  output logic        cycle_start_o,
+  output logic [31:0] active_period_o
 );
   localparam logic [31:0] ID_VERSION = 32'h50554c01;
   localparam logic [31:0] DEFAULT_PERIOD = 32'd500000; // 1 ms
@@ -185,6 +187,7 @@ module pulse_gen #(
   end
 
   logic [31:0] phase;
+  logic previous_d2;
   logic [1:0] ddr_data;
   logic [1:0] claim_drive_delay;
   (* ASYNC_REG = "TRUE" *) logic [1:0] gpio_data_sync;
@@ -203,7 +206,9 @@ module pulse_gen #(
       phase <= '0;
       ddr_data <= '0;
       gpio_data_sync <= '0;
+      previous_d2 <= 1'b0;
     end else begin
+      previous_d2 <= claim_sync[1] ? ddr_data[1] : gpio_data_sync[1];
       gpio_data_sync <= {gpio_data_sync[0], gpio_data_i};
       request_sync <= {request_sync[0], request_toggle};
       claim_sync <= {claim_sync[0], claimed};
@@ -244,4 +249,9 @@ module pulse_gen #(
   // Otherwise a saved HIGH GPIO data bit could leak out during first ON.
   // Release immediately when claim_sync clears, before GPIO passthrough resumes.
   assign pin_dir_o = (claim_sync[1] && claim_drive_delay[1]) ? 1'b1 : gpio_dir_i;
+  // Sampled at fast_clk_i: exactly the D1 edge presented to ODDR on this
+  // clock, after the ddr_data pipeline and ownership guard. No pin loopback.
+  assign cycle_start_o = active_enable && claim_sync[1] && claim_drive_delay[1] &&
+                         ddr_data[0] && !previous_d2;
+  assign active_period_o = active_period;
 endmodule

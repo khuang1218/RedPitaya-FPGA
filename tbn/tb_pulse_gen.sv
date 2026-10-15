@@ -8,13 +8,26 @@ module tb_pulse_gen;
   reg wen = 0, ren = 0, gpio_data = 0, gpio_dir = 0;
   wire [31:0] rdata;
   wire ack, err, pin_data, pin_dir;
+  wire cycle_start;
+  wire [31:0] active_period;
   pulse_gen dut (
     .bus_clk_i(bus_clk), .fast_clk_i(fast_clk), .arstn_i(arstn),
     .sys_addr_i(addr), .sys_wdata_i(wdata), .sys_wen_i(wen), .sys_ren_i(ren),
     .sys_rdata_o(rdata), .sys_ack_o(ack), .sys_err_o(err),
     .gpio_data_i(gpio_data), .gpio_dir_i(gpio_dir),
-    .pin_data_o(pin_data), .pin_dir_o(pin_dir)
+    .pin_data_o(pin_data), .pin_dir_o(pin_dir),
+    .cycle_start_o(cycle_start),.active_period_o(active_period)
   );
+  reg marker_at_clock, pin_before_clock;
+  always @(posedge fast_clk) begin
+    marker_at_clock=cycle_start;pin_before_clock=pin_data;
+    #0.01;
+    if(arstn && marker_at_clock && (!pin_data || !pin_dir))
+      $fatal(1,"Cycle marker did not coincide with an output rising edge");
+    if(arstn && dut.active_enable && dut.claim_drive_delay[1] &&
+       !pin_before_clock && pin_data && !marker_at_clock)
+      $fatal(1,"Output rising edge lacked a cycle marker");
+  end
 
   task automatic wr(input [15:0] offset, input [31:0] value, input bit expect_error = 0);
     @(negedge bus_clk); addr = {16'h4072, offset}; wdata = value; wen = 1;

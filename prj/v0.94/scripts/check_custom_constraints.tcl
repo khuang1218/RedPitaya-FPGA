@@ -9,6 +9,15 @@ proc custom_check_count {label objects minimum {maximum -1}} {
 }
 custom_check_count "TDC carries" [get_cells -quiet -hier -filter {REF_NAME == CARRY4 && NAME =~ *i_tdc/i_carry/*}] 128 128
 custom_check_count "TDC tap D pins" [get_pins -quiet -hier -filter {NAME =~ *i_tdc/i_carry/gen_tap*i_tap_ff/D}] 512 512
+custom_check_count "Width TDC carries" [get_cells -quiet -hier -filter {REF_NAME == CARRY4 && NAME =~ *i_tdc/i_width/i_carry/*}] 128 128
+custom_check_count "Width TDC tap D pins" [get_pins -quiet -hier -filter {NAME =~ *i_tdc/i_width/i_carry/gen_tap*i_tap_ff/D}] 512 512
+# A large result array must infer dedicated BRAM; count after synthesis rather
+# than accepting LUT/FF expansion. Actual packing/total use is report-dependent.
+custom_check_count "Width result BRAM primitives" [get_cells -quiet -hier -filter {NAME =~ *i_tdc/i_width/* && REF_NAME =~ RAMB*}] 1
+custom_check_count "Width first CDC stages" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/(request_sync|abort_sync|ack_sync|capture_sync|process_sync)_reg\[0\]}] 5 5
+custom_check_count "Width reset synchronizer CLR pins" [get_pins -of_objects [get_cells -quiet -hier -regexp {.*i_tdc/i_width/fast_reset_pipe_reg\[[0-2]\]}] -filter {REF_PIN_NAME == CLR}] 3 3
+custom_check_count "Width configuration mailbox" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/(requested_count|timeout_cfg|lut_enabled|clear_request)_reg(\[[0-9]+\])?}] 1
+custom_check_count "Width completion metadata" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/(completed_fast|flags_fast)_reg\[[0-9]+\]}] 1
 foreach pattern {*i_tdc/return_sync_meta_reg/D *i_tdc/i_internal_stimulus/enable_meta_reg/D *i_tdc/i_mmcm_stimulus/toggle_meta_reg/D *i_tdc/i_mmcm_stimulus/locked_meta_reg/D} {
   custom_check_count $pattern [get_pins -quiet -hier -filter "NAME =~ $pattern"] 1 1
 }

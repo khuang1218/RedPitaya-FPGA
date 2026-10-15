@@ -5,7 +5,223 @@ It coexists with BNET and the GPIO pulse generator in system-bus slot 7.
 Current workspace setup, validation and next actions are in the
 [master handover](../../../../../RedPitaya_app/HANDOVER.md).
 
-## Physical E3 allocation
+**Current interface v6:** the `TDC:WIDTH:*` path measures PCB HIGH pulse
+width in finite bursts. It uses the actual pulse_gen cycle marker and a
+separate 250 MHz carry sampler. The legacy commands/registers below retain
+their earlier launch-to-rising-edge meaning. Use the new width procedure for
+the PCB's voltage-dependent output duration.
+
+## PCB pulse-width acquisition (v6 / PWB v1, 16384 records)
+
+The first implementation intentionally limits acquisition to **1 MHz or slower**
+FPGA triggers, at **50% drive duty**. Pulse generation itself retains its
+existing frequency range. 125 MHz pulse-width capture is a future target.
+The 250 MHz sampler has a nominal **4 ns coarse tick**; use HIGH and LOW gaps
+of at least **8 ns**, and characterize actual detection limits on the board.
+Narrower pulses/gaps can be missed or merged; a small printed ps unit is not
+proof of ps resolution. Completed pulse frames are encoded while later frames
+are captured; compact results are retained for readout after the burst.
+
+Wire DIO1_P / **E1 pin 5** to the PCB trigger input. Wire its confirmed 3.3 V
+single-ended output to DIO2_P / **E1 pin 7**, with E1 ground 25/26. Select
+`TDC:INPUT SINGLE`; the LVDS return alternative remains E3 contacts 31/33.
+**Do not connect E3 launch contacts 7/9 for this PCB protocol.** The independent
+legacy E3 launch is suppressed during width acquisition, and legacy enable
+and test modes must be OFF before arming.
+
+The carry path remains running. Trigger boundaries manage cycle IDs and
+capture ownership; they do not reset the physical delay line. Separate raw
+snapshots and coarse times retain the PCB rising and falling edges, including
+a falling edge arriving while the old serial encoder would still be busy.
+A burst of N records uses N+1 observed trigger boundaries. Memory freezes
+before software receives completion, so delayed/repeated reads are stable.
+The default capacity is **16384 records**, with a default requested count of 16.
+This matches the ADC buffer's record count, not its sampling rate. At 1 MHz,
+16384 pulse periods span **16.384 ms**, plus initial alignment and final decoding.
+
+Only **four raw frames** are staged at once, with a separate capture controller
+and result processor. The width encoder consumes **eight taps per clock**,
+retaining the same majority-filter/status definitions as the one-tap legacy
+encoder. At 512 taps, processing both edge codes and arithmetic takes less than
+one 1 us trigger period. A stalled processor raises OVERFLOW and discards the
+burst, rather than overwriting an unread frame silently.
+
+Each stored result is **114 bits** at 512 taps: flags, coarse ticks, two 9-bit
+indices and width_ps. Cycle ID is derived from the address; the API still reads
+the same five 32-bit words. The result buffer is **228 KiB of logical memory**,
+plus a 544-byte raw-frame ring and 2 KiB of LUT data. The raw ring uses distributed
+RAM; results use block RAM. This replaces the v5 scheme whose full raw snapshots
+would need about 2.44 MiB at this depth. Actual BRAM packing and the remaining
+resources in the merged BNET/scope/ASG design require an external utilization
+check. No array is bulk-reset in the capture logic.
+
+The first external synthesis reported **Synth 8-3391** for the 524288-bit
+`rise_memory_reg` array. The previous conditional assignments to current and
+next-frame addresses prevented block-RAM inference. The repaired RTL selects
+write enable/address/data outside the memory process and gives each capture
+RAM exactly one write statement and one synchronous read. The v6 design keeps
+that access pattern for both the small ring and the larger result memory.
+Refresh the project-local `tdc_pulse_width.sv`, `tdc_thermometer_encoder.sv` and
+`tdc_registers.sv` copies and reset synthesis before retrying.
+Do not use the suggested `dissolveMemorySizeLimit` increase as the repair:
+expanding this buffer into individual bits would defeat block-RAM inference.
+Local simulation and HDL checks cannot confirm Vivado's inferred resources;
+inspect the new synthesis log and hierarchical utilization on the build machine.
+
+### First-board sequence
+
+Rebuild/reload the FPGA and rebuild/redeploy both API and SCPI server (static
+API link). Check `0x54444306` at `0x40710000` and `0x50574201` at `0x40710100`.
+`TDC:WIDTH:CAPACITY?` must return 16384 for the default v6 build. The v5/PWB v1
+API register layout remains compatible; the updated script removes its old
+1024-record limit and understands the added overflow status.
+Start pulse_gen **before** width ARM, avoiding a network round-trip inside the
+stopped-trigger watchdog. ARM sets that watchdog to two configured periods
+plus 32 sampler clocks; a trigger stopped mid-burst produces an explicit error.
+
+```text
+PULSE:OUTPUT OFF
+TDC:ENABLE OFF
+TDC:TEST:INTERNAL OFF
+TDC:MMCM:ENABLE OFF
+TDC:RESET
+TDC:INPUT SINGLE
+TDC:WIDTH:CALIBRATION:ACTIVATE OFF
+PULSE:TIMING 1000,500
+PULSE:OUTPUT ON
+TDC:WIDTH:ARM 16
+TDC:WIDTH:STATUS?
+```
+
+Poll STATUS until bit 0 (BUSY) clears; require DONE and no global error. Then:
+
+```text
+PULSE:OUTPUT OFF
+TDC:WIDTH:COUNT?
+TDC:WIDTH:DATA? 0,16
+```
+
+DATA replies with semicolon-separated records, each containing:
+`cycle_id,flags,coarse_ticks,rise_raw,fall_raw,width_ps`.
+Read 1..128 records per query; indexes are zero-based, cycle IDs start at one.
+Use `TDC:WIDTH:ABORT` to discard a running burst, then poll BUSY clear before
+reconfiguration. `TDC:WIDTH:CLEAR` invalidates the completed buffer; it does
+not turn off pulse_gen. Let an already-triggered PCB pulse finish before rearm.
+
+The app's `scpi-tests/tdc_pulse_width_test.py BOARD_IP --count 16` implements
+this sequence, prints all flags and can save CSV with `--csv result.csv`.
+It finishes with pulse output OFF and an abort command, and reports invalid
+cycles rather than treating zero as a successful width measurement.
+
+After the short wiring test, capture the full buffer from the app workspace:
+
+```text
+python scpi-tests/tdc_pulse_width_test.py BOARD_IP --count 16384 --csv tdc_width_16384.csv --quiet
+```
+
+The script reads 128 records per query (128 queries for the full burst).
+`--quiet` suppresses per-pulse printing while preserving every CSV row and
+the validity/error checks. This remains finite capture followed by readout;
+it does not implement continuous PC streaming.
+
+### Width register page
+
+Offsets below are relative to TDC base `0x40710000` (not the pulse-generator base).
+
+| Offset | Access | Meaning |
+|---:|---|---|
+| 0x100 | R | PWB ID/version: `0x50574201` |
+| 0x104 | W | Exactly one command: 1 ARM, 2 ABORT, 4 CLEAR |
+| 0x108 | R | Status flags below; BUSY covers command transfer, capture and processing |
+| 0x10c | R/W | Requested record count 1..CAPACITY; idle only |
+| 0x110 | R | Record capacity, default 16384 |
+| 0x114 | R | Completed result count; reads zero while busy |
+| 0x118 | R/W | Record index, idle and below completed count |
+| 0x11c | R | Selected record word 0: cycle ID |
+| 0x120 | R | Word 1: record flags |
+| 0x124 | R | Word 2: coarse width ticks |
+| 0x128 | R | Word 3: rise raw index in bits 15:0; fall raw index in bits 31:16 |
+| 0x12c | R | Coarse tick, nominal 4000 ps |
+| 0x130 | R/W | Stopped-trigger timeout in 4 ns clocks; idle only; ARM API derives it from pulse timing |
+| 0x134 | R | Word 4: width in ps; valid only with record VALID flag |
+| 0x138 | R/W | Width LUT address: rise 0..511, fall 512..1023 |
+| 0x13c | R/W | Width LUT entry, 0..65535 ps; idle only |
+| 0x140 | R/W | Write: 1 invalidate tables, 2 activate, 4 disable. Read: bit 0 enabled, bit 2 both tables fully written |
+| 0x144 | R | Minimum permitted trigger period: 1000 ns |
+
+Status bits: 0 BUSY, 1 CAPTURING (including wait for first trigger), 2 PROCESSING,
+3 DONE, 4 TRIGGER_TIMEOUT, 5 RATE_ERROR, 6 ABORTED, 7 OVERFLOW (raw-frame ring).
+CAPTURING and PROCESSING can both be set. On abort, unsafe rate or overflow,
+partial results are discarded. A stopped trigger can preserve partial frame records
+marked invalid along with the global timeout. A new ARM hides old completion
+flags while busy; input changes invalidate old results and width calibration.
+
+Record flags:
+
+| Bit | Meaning |
+|---:|---|
+| 0 | VALID: one observed rising/falling pair, no frame error |
+| 1 / 2 | NO_RISE / NO_FALL |
+| 3 | Input HIGH at cycle start without a new observed rise |
+| 4 | Extra edge(s) in the frame |
+| 5 | Trigger timeout interrupted the frame |
+| 7 | FINE_INVALID: at least one carry snapshot did not encode as a valid thermometer |
+| 8 | COARSE_ONLY: width uses 4 ns ticks; no fine correction applied |
+| 9 | CALIBRATED: uploaded rise/fall LUT correction applied |
+| 10 | Falling edge exactly at observed trigger boundary; frame marked invalid |
+| 11 | SATURATED: missing falling edge while input remains HIGH |
+| 12 | OUT_OF_RANGE: coarse ps value exceeds the 32-bit width field; invalid |
+| 23:16 / 31:24 | Rise / fall encoder diagnostic status bytes, using legacy encoder flag definitions |
+
+VALID may accompany COARSE_ONLY and FINE_INVALID: the coarse pair is usable
+but the raw fine interpolation is not. Invalid frames have width_ps=0 and
+must be distinguished by flags. The maximum representable width is about
+4.295 ms; larger coarse results are flagged rather than wrapping.
+
+### Width calibration and implementation checks
+
+Default correction is OFF. Do not apply the old 125 MHz TDC LUT to this
+separate 250 MHz carry path. After characterizing the placed width path,
+upload **both** measured 512-entry tables using:
+
+```text
+TDC:WIDTH:CALIBRATION:LUT:WRITE RISE,0,<values...>
+TDC:WIDTH:CALIBRATION:LUT:WRITE FALL,0,<values...>
+TDC:WIDTH:CALIBRATION:ACTIVATE ON
+TDC:WIDTH:CALIBRATION:ACTIVATE?
+```
+
+Uploads can be split into address ranges. Activation requires every entry of
+both tables to have been written. Editing a table disables correction; input
+changes invalidate table readiness. Width = coarse_ticks * 4000 + rise_LUT -
+fall_LUT. Invalid fine codes fall back to coarse timing with flags. No automatic
+code-density calibration or certified fine accuracy is supplied by this release.
+
+Refresh project copies with the updated helper, which now includes
+`tdc_pulse_width.sv`. Keep all tbn replacement models out of Vivado filesets.
+The new carry hierarchy is `i_tdc/i_width/i_carry`; the legacy path remains
+`i_tdc/i_carry`. Placement helpers accept that hierarchy as an optional final
+argument. Choose separate legal locations; no coordinates were selected here.
+The TDC XDC includes intentional tap/synchronizer exceptions and bounded
+configuration/completion transfers. Ordinary capture, encoder, RAM, reset
+release and arithmetic paths remain timed. Source the collection checker in
+the new synthesized design, then inspect timing, CDC, DRC and resource use.
+The checker now also requires dedicated RAMB primitives under the width block;
+its presence check does not replace reviewing total utilization and packing.
+
+Local ideal-delay/controller tests cover both edges, full burst capacity,
+coarse and synthetic LUT results, missing/extra edges, saturation, rate rejection,
+watchdog, abort/rearm, trigger-boundary RAM writes, forced staging overflow
+and stable CDC readout.
+The standalone width testbench also supports `FULL_SIZE=1` for the production
+512-tap / 16384-record dimensions, checking every result and capture/encoding overlap.
+This full 1 MHz regression passes, as do the integrated and fault regressions.
+The grouped encoder test compares both modes to an independent reference,
+including exhaustive 16-tap patterns and 17/512-tap cases; all pass.
+These tests do not establish Vivado RAM inference or
+physical carry delays, board detection limits, fine accuracy or routed timing.
+
+## Legacy E3 launch and LVDS return allocation
 
 | Function | Top-level port | E3 signal | E3 connector contacts P/N | Zynq package pins |
 |---|---|---|---|---|
@@ -96,7 +312,7 @@ effect once even though the system-bus request remains asserted until `ack`.
 
 | Offset | Register | Access | Reset / description |
 |---:|---|---|---|
-| `0x00` | `ID_VERSION` | R | `0x54444304` (`TDC`, v4: selectable external LVDS/single-ended input) |
+| `0x00` | `ID_VERSION` | R | `0x54444306` (`TDC`, v6: selectable input and compact 16384-record width bursts) |
 | `0x04` | `CONTROL` | R/W | Persistent and pulse control fields below |
 | `0x08` | `STATUS` | R | Live state and FIFO level fields below |
 | `0x0c` | `LAUNCH_PERIOD` | R/W | 125000 clocks (1 ms at 125 MHz); zero clamps to one |
