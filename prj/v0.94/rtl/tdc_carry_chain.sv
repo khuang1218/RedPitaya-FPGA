@@ -3,6 +3,8 @@
 //
 // The hierarchy and instance names in this file are consumed by the TDC XDC.
 // Do not flatten or mechanically rename them without updating the constraints.
+// For the two WIDTH instances, tdc_width_sampler_layout.xdc pairs every local
+// sampler with its carry slice. DONT_TOUCH alone does not enforce colocation.
 ////////////////////////////////////////////////////////////////////////////////
 
 (* KEEP_HIERARCHY = "TRUE", DONT_TOUCH = "TRUE" *)

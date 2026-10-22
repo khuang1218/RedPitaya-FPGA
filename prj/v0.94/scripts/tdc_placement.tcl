@@ -8,7 +8,11 @@
 # Optional final hierarchy argument selects the new width path:
 #   tdc_place_chain <X> <Y> i_tdc/i_width/i_carry
 #   tdc_write_placement_xdc <width.xdc> <X> <Y> i_tdc/i_width/i_carry
-# Choose separate legal locations for legacy and width chains.
+# V9 has a second width chain for the inverted-input falling-edge sampler:
+#   tdc_place_chain <X> <Y> i_tdc/i_width/i_fall_carry
+#   tdc_write_placement_xdc <fall.xdc> <X> <Y> i_tdc/i_width/i_fall_carry
+# Choose separate legal locations for all three chains; never reuse one chain's
+# selected coordinates or placement output filename for another chain.
 #
 # Example syntax only (the coordinates are NOT a recommendation):
 #   tdc_place_chain 42 10

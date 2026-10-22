@@ -53,6 +53,8 @@
  */
 
 // Build-time BNET engine selection.
+// DISABLE_BNET excludes every BNET engine, reader, register bank and capture
+// RAM. The refresh helper enables this option by default; sources are kept.
 //
 // Define BNET_ENABLE_SDF to replace the fixed-weight frame pipeline with the
 // experimental static-weight SDF streaming engine. Comment this line out to use
@@ -452,6 +454,7 @@ assign asg_axi_b_dummy.rdata = 64'd0;
 assign asg_axi_b_dummy.rerr  = 1'b0;
 assign asg_axi_b_dummy.rrdym = 1'b1;
 assign asg_axi_b_dummy.rardy = 1'b1;
+`ifndef DISABLE_BNET
 assign bnet_stream_read_ptr[0] = bnet_ddr_sample_rptr;
 assign bnet_stream_read_ptr[1] = bnet_ddr_weight_rptr;
 assign bnet_stream_debug0[0] = bnet_ddr_sample_debug0;
@@ -657,6 +660,11 @@ for (genvar BNET_RPTR_IDX = 2; BNET_RPTR_IDX < BNET_STREAM_COUNT; BNET_RPTR_IDX+
   assign bnet_stream_debug1[BNET_RPTR_IDX] = 32'd0;
 end
 endgenerate
+`else
+// BNET excluded: preserve ordinary ADC/scope input without combine logic.
+assign scope_adc_dat[0]=adc_dat[0];
+assign scope_adc_dat[1]=adc_dat[1];
+`endif
 ////////////////////////////////////////////////////////////////////////////////
 // PLL (clock and reset)
 ////////////////////////////////////////////////////////////////////////////////
@@ -943,6 +951,7 @@ end
 //end
 
 ////////////////////////////////////////////////////////////////////////////////
+`ifndef DISABLE_BNET
 // BNET digital output capture
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -1272,7 +1281,42 @@ always_ff @(posedge adc_clk) begin
   end
 end
 
-// Sign-extend the 14-bit butterfly outputs to the existing 15-bit saturation
+`else
+// No BNET engines, DDR readers, serializer or capture RAM in this build.
+// Keep normal local-table ASG output available on the DACs.
+assign bnet_dac_dat[0]=asg_dat[0];
+assign bnet_dac_dat[1]=asg_dat[1];
+assign axi2_sys.waddr='0;
+assign axi2_sys.wdata='0;
+assign axi2_sys.wsel='0;
+assign axi2_sys.wsize='0;
+assign axi2_sys.wvalid='0;
+assign axi2_sys.wlen='0;
+assign axi2_sys.wfixed='0;
+assign axi2_sys.raddr='0;
+assign axi2_sys.rsel='0;
+assign axi2_sys.rsize='0;
+assign axi2_sys.rvalid='0;
+assign axi2_sys.rlen='0;
+assign axi2_sys.rfixed='0;
+assign axi2_sys.rrdys='0;
+assign axi3_sys.waddr='0;
+assign axi3_sys.wdata='0;
+assign axi3_sys.wsel='0;
+assign axi3_sys.wsize='0;
+assign axi3_sys.wvalid='0;
+assign axi3_sys.wlen='0;
+assign axi3_sys.wfixed='0;
+assign axi3_sys.raddr='0;
+assign axi3_sys.rsel='0;
+assign axi3_sys.rsize='0;
+assign axi3_sys.rvalid='0;
+assign axi3_sys.rlen='0;
+assign axi3_sys.rfixed='0;
+assign axi3_sys.rrdys='0;
+`endif
+
+// Sign-extend the selected 14-bit outputs to the existing 15-bit saturation
 // stage. Keeping the saturation stage in place preserves the original DAC path
 // structure and makes later experiments easier.
 assign dac_a_sum = {bnet_dac_dat[0][14-1], bnet_dac_dat[0]};
@@ -1363,6 +1407,7 @@ red_pitaya_hk #(.DWE(DWE)) i_hk (
 
   // LED
   .led_o           (  led_hk   ),  // LED output
+  .diag_i          (32'd0),         // no external housekeeping diagnostics
   // global configuration
   .digital_loop    (digital_loop),
   .daisy_mode_o    (daisy_mode),
@@ -1717,8 +1762,8 @@ red_pitaya_daisy  #(
   .par_clk_i       (  adc_clk                    ),  // data paralel clock
   .par_rstn_i      (  adc_rstn                   ),  // reset - active low
   //.par_rdy_o       (  daisy_rx_rdy               ),
-  //.par_dv_i        (  par_dvi                    ),
-  //.par_dat_i       (  par_dati                   ),
+  .par_dv_i        (  2'b00                     ), // unused parallel TX input
+  .par_dat_i       (  32'd0                     ),
    // RX
   //.par_clk_o       ( adc_clk_daisy               ),
   //.par_rstn_o      (                             ),
@@ -1831,6 +1876,7 @@ tdc_top #(
     .active_period_o (pulse_active_period)
   );
 
+`ifndef DISABLE_BNET
   // BNET retains its full address and all existing register offsets.
   bnet_regs #(
     .STREAM_COUNT (BNET_STREAM_COUNT)
@@ -1883,6 +1929,21 @@ tdc_top #(
     .stream_debug1_i(bnet_stream_debug1),
     .stream_runtime_error_i(bnet_stream_runtime_error)
   );
+
+`else
+  // Removed region still responds: software sees no BNET signature and does
+  // not stall. TDC and PULSE retain their existing independent addresses.
+  assign bnet_sys_rdata=32'd0;
+  // A benign response permits software capability probing without an AXI fault.
+  assign bnet_sys_err=1'b0;
+  always_ff @(posedge adc_clk) begin
+    if (!adc_rstn) bnet_sys_ack<=0;
+    else bnet_sys_ack<=bnet_sys_wen || bnet_sys_ren;
+  end
+  assign bnet_led_debug=0;
+  assign bnet_led_debug_en=0;
+  assign bnet_led6_heartbeat_en=0;
+`endif
 
 `else
 // SCOPE_ONLY build option:

@@ -329,13 +329,16 @@ end
 assign tx_sel = sync_mode_i ? 3'h1 : tx_cfg_sel;
 // output data selector
 always @(*) begin
+   // Reserved/unknown selectors are idle; every path assigns both outputs.
+   txp_dat[GV*16 +: 16] = 16'h0;
+   txp_dv[GV] = 1'b0;
    case (tx_sel)
-      3'h0 : begin txp_dat[GV*16 +: 16] <= 16'h0                  ;   txp_dv[GV] <= 1'b0         ; end
-      3'h1 : begin txp_dat[GV*16 +: 16] <= par_dat_i[GV*16 +: 16] ;   txp_dv[GV] <= par_dv_i[GV] ; end  // working data
-      3'h2 : begin txp_dat[GV*16 +: 16] <= tx_cfg_dat             ;   txp_dv[GV] <= txp_rdy[GV]  ; end  // manual value
-      3'h3 : begin txp_dat[GV*16 +: 16] <= 16'h00FF               ;   txp_dv[GV] <= txp_rdy[GV]  ; end  // training data
-      3'h4 : begin txp_dat[GV*16 +: 16] <= tx_rx_dat              ;   txp_dv[GV] <= tx_rx_dv     ; end  // send back received data
-      3'h5 : begin txp_dat[GV*16 +: 16] <= tst_dat[GV*16 +: 16]   ;   txp_dv[GV] <= tst_dv[GV]   ; end  // random testing data
+      3'h0 : begin txp_dat[GV*16 +: 16] = 16'h0                  ;   txp_dv[GV] = 1'b0         ; end
+      3'h1 : begin txp_dat[GV*16 +: 16] = par_dat_i[GV*16 +: 16] ;   txp_dv[GV] = par_dv_i[GV] ; end  // working data
+      3'h2 : begin txp_dat[GV*16 +: 16] = tx_cfg_dat             ;   txp_dv[GV] = txp_rdy[GV]  ; end  // manual value
+      3'h3 : begin txp_dat[GV*16 +: 16] = 16'h00FF               ;   txp_dv[GV] = txp_rdy[GV]  ; end  // training data
+      3'h4 : begin txp_dat[GV*16 +: 16] = tx_rx_dat              ;   txp_dv[GV] = tx_rx_dv     ; end  // send back received data
+      3'h5 : begin txp_dat[GV*16 +: 16] = tst_dat[GV*16 +: 16]   ;   txp_dv[GV] = tst_dv[GV]   ; end  // random testing data
    endcase
 end
 

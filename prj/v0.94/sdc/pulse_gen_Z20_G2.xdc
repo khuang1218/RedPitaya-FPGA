@@ -8,5 +8,5 @@ set_false_path -to [get_pins -of_objects [get_cells -quiet -hier -regexp {.*i_pu
 
 # Bundled mailbox data is held until the synchronized acknowledgement returns.
 # Bound real data paths instead of masking an entire clock pair.
-set_max_delay -datapath_only 4.000 -from [get_cells -quiet -hier -regexp {.*i_pulse_gen/mailbox_(period|high|last|enable)_reg(\[[0-9]+\])?}] -to [get_cells -quiet -hier -regexp {.*i_pulse_gen/active_(period|high|last|enable)_reg(\[[0-9]+\])?}]
+set_max_delay -datapath_only 4.000 -from [get_cells -quiet -hier -regexp {.*i_pulse_gen/mailbox_(period|high|last|prelast|enable)_reg(\[[0-9]+\])?}] -to [get_cells -quiet -hier -regexp {.*i_pulse_gen/active_(period|high|last|prelast|enable)_reg(\[[0-9]+\])?}]
 set_max_delay -datapath_only 8.000 -from [get_cells -quiet -hier -regexp {.*i_pulse_gen/active_(period|high)_reg\[[0-9]+\]}] -to [get_cells -quiet -hier -regexp {.*i_pulse_gen/readback_(period|high)_reg\[[0-9]+\]}]

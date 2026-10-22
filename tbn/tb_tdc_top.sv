@@ -1,6 +1,7 @@
 `timescale 1ns/1ps
 module tb_tdc_top;
   reg clk=0,test_clk=0,fast_clk=0,rstn=0,wen=0,ren=0;
+  integer bus_hold_cycles=2;
   always #4 clk=~clk;
   always #3 test_clk=~test_clk;
   always #2 fast_clk=~fast_clk;
@@ -16,6 +17,8 @@ module tb_tdc_top;
   reg return_p=0,respond=1,hold_return=0;
   reg return_single=0,respond_single=0;
   integer launches=0;
+  integer launch_falls=0;
+  realtime launch_start, expected_launch_width;
   tdc_top #(.NUM_CARRY4(4)) dut(
     .clk_i(clk),.rstn_i(rstn),.test_clk_i(test_clk),.test_rstn_i(rstn),
     .fast_clk_i(fast_clk),.pulse_cycle_start_i(width_marker),.pulse_period_i(32'd500),
@@ -36,10 +39,29 @@ module tb_tdc_top;
       #50; if(!hold_return) begin return_p=0; return_single=0; end
     end
   end
+  // Launch width is latched per pulse, even if its result is ready earlier.
+  always @(posedge launch_p) if(rstn) begin
+    launch_start=$realtime;
+    expected_launch_width=8.0*dut.launch_width;
+  end
+  always @(negedge launch_p) if(rstn && launches>0) begin
+    launch_falls=launch_falls+1;
+    if($realtime-launch_start<expected_launch_width-0.01 ||
+       $realtime-launch_start>expected_launch_width+0.01)
+      $fatal(1,"Launch width changed: got %0.3f expected %0.3f",$realtime-launch_start,expected_launch_width);
+  end
   task automatic wr(input [15:0] offset,input [31:0] value);
     @(negedge clk); addr={16'h4071,offset}; wdata=value; wen=1;
     @(posedge clk); #0.01;
     if(!ack || err) $fatal(1,"Write failed at %h",offset);
+    repeat(bus_hold_cycles-1) begin
+      @(posedge clk);#0.01;
+      if(!ack || err) $fatal(1,"Held write failed at %h",offset);
+      if(dut.trigger || dut.soft_reset || dut.fifo_clear || dut.fifo_pop ||
+         dut.mmcm_ps_request || dut.mmcm_reset || dut.histogram_clear ||
+         dut.calibration_write || dut.calibration_activate || dut.calibration_invalidate)
+        $fatal(1,"Held write repeated a command pulse at %h",offset);
+    end
     @(negedge clk); wen=0;
     @(negedge clk);
   endtask
@@ -47,6 +69,10 @@ module tb_tdc_top;
     @(negedge clk); addr=32'h40710090; wdata=value; wen=1;
     @(posedge clk); #0.01;
     if(!ack || !err) $fatal(1,"Unsafe/invalid input write accepted");
+    repeat(bus_hold_cycles-1) begin
+      @(posedge clk);#0.01;
+      if(!ack || !err) $fatal(1,"Rejected input response changed");
+    end
     @(negedge clk); wen=0;
     @(negedge clk);
   endtask
@@ -55,7 +81,13 @@ module tb_tdc_top;
     @(posedge clk); #0.01;
     if(!ack || err) $fatal(1,"Read failed at %h",offset);
     value=rdata;
+    repeat(bus_hold_cycles-1) begin
+      @(posedge clk);#0.01;
+      if(!ack || err || rdata!==value) $fatal(1,"Held read response changed at %h",offset);
+    end
     @(negedge clk); ren=0;
+    repeat(2) @(negedge clk);
+    if(rdata!==value) $fatal(1,"Read response changed after request at %h",offset);
   endtask
   task automatic get_record(input bit timeout_expected,input integer sequence_expected);
     reg [31:0] level,a,b,c,d,coarse,fine,total_lo,total_hi;
@@ -85,13 +117,30 @@ module tb_tdc_top;
   reg [31:0] value;
   integer previous_launches;
   initial begin
+    if($value$plusargs("BUS_HOLD_CYCLES=%d",bus_hold_cycles)) begin end
+    if(bus_hold_cycles<1) $fatal(1,"BUS_HOLD_CYCLES must be positive");
     // Exercise an input transition after the UNISIM buffer initializes.
     #1; return_p=1; #1; return_p=0;
     #118; rstn=1; repeat(8) @(negedge clk);
-    rd(0,value); if(value!==32'h54444306) $fatal(1,"ID mismatch");
+    rd(0,value); if(value!==32'h5444430e) $fatal(1,"ID mismatch");
     rd(16'h90,value); if(value!=0) $fatal(1,"Default source is not LVDS");
     reject_input(2);
     rd(16'h18,value); if(value!=16) $fatal(1,"Tap count mismatch");
+    // A result can finish long before a wide launch does. Continuous mode
+    // must not reload that pulse's countdown and stretch it indefinitely.
+    wr(16'h10,128);wr(16'h0c,1);wr(16'h14,20);wr(16'h04,5);
+    wait(launch_p);
+    repeat(160) @(negedge clk);
+    if(launch_falls==0) $fatal(1,"Continuous re-arm prevented the long pulse from finishing");
+    wr(16'h04,0);
+    repeat(140) @(negedge clk);
+    if(launch_p) $fatal(1,"Launch did not finish after disable");
+    wr(16'h04,8);wr(16'h10,2);wr(16'h0c,125000);
+    // No request is active: a later address/status change must not replace
+    // the response while the CDC bridge is still returning it to the PS.
+    rd(0,value);addr=32'h40710018;
+    repeat(3) @(negedge clk);
+    if(rdata!==value) $fatal(1,"Idle address change replaced the read response");
     wr(16'h1c,8002); // Odd fine value exposes the former 127-bit FIFO bug.
     wr(16'h14,20); wr(16'h04,1); wr(16'h04,3);
     get_record(0,1);

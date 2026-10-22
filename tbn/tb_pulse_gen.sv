@@ -6,6 +6,7 @@ module tb_pulse_gen;
   initial begin #0.7; forever begin #2; if (fast_run) fast_clk = ~fast_clk; else fast_clk = 0; end end
   reg [31:0] addr = 0, wdata = 0;
   reg wen = 0, ren = 0, gpio_data = 0, gpio_dir = 0;
+  integer bus_hold_cycles = 2;
   wire [31:0] rdata;
   wire ack, err, pin_data, pin_dir;
   wire cycle_start;
@@ -24,15 +25,26 @@ module tb_pulse_gen;
     #0.01;
     if(arstn && marker_at_clock && (!pin_data || !pin_dir))
       $fatal(1,"Cycle marker did not coincide with an output rising edge");
-    if(arstn && dut.active_enable && dut.claim_drive_delay[1] &&
+    if(arstn && dut.active_enable && dut.claim_drive_delay[2] &&
        !pin_before_clock && pin_data && !marker_at_clock)
       $fatal(1,"Output rising edge lacked a cycle marker");
   end
 
   task automatic wr(input [15:0] offset, input [31:0] value, input bit expect_error = 0);
+    reg accepted_toggle;
     @(negedge bus_clk); addr = {16'h4072, offset}; wdata = value; wen = 1;
     @(posedge bus_clk); #0.01;
     if (!ack || err != expect_error) $fatal(1, "Write %h ACK/ERR mismatch", offset);
+    accepted_toggle = dut.request_toggle;
+    // The real CDC bridge keeps WEN asserted until the registered ACK.
+    // Longer holds also catch a command replay after the mailbox becomes idle.
+    repeat (bus_hold_cycles - 1) begin
+      @(posedge bus_clk); #0.01;
+      if (!ack || err != expect_error)
+        $fatal(1, "Held write %h ACK/ERR changed", offset);
+      if (dut.request_toggle !== accepted_toggle)
+        $fatal(1, "Held write %h launched a duplicate mailbox request", offset);
+    end
     @(negedge bus_clk); wen = 0;
   endtask
   task automatic rd(input [15:0] offset, output [31:0] value, input bit expect_error = 0);
@@ -40,6 +52,11 @@ module tb_pulse_gen;
     @(posedge bus_clk); #0.01;
     if (!ack || err != expect_error) $fatal(1, "Read %h ACK/ERR mismatch", offset);
     value = rdata;
+    repeat (bus_hold_cycles - 1) begin
+      @(posedge bus_clk); #0.01;
+      if (!ack || err != expect_error || rdata !== value)
+        $fatal(1, "Held read %h response changed", offset);
+    end
     @(negedge bus_clk); ren = 0;
   endtask
   task automatic idle;
@@ -77,6 +94,8 @@ module tb_pulse_gen;
 
   reg [31:0] value;
   initial begin
+    if ($value$plusargs("BUS_HOLD_CYCLES=%d", bus_hold_cycles)) begin end
+    if (bus_hold_cycles < 1) $fatal(1, "BUS_HOLD_CYCLES must be positive");
     #19; arstn = 1; #48; idle();
     rd(0, value); if (value != 32'h50554c01) $fatal(1, "ID mismatch");
     // The PS bus bridge returns registered data several clocks after the
@@ -87,9 +106,25 @@ module tb_pulse_gen;
     repeat (4) @(posedge bus_clk); #0.01;
     if (rdata !== 32'd2) $fatal(1, "Tick readback cleared before bus CDC returned it");
     rd(16'h001c, value); if (value != 1) $fatal(1, "GPIO index mismatch");
-    gpio_dir = 1; gpio_data = 1; #12;
+
+    // Reproduce the notebook's OFF -> TIMING 1000,500 -> ON -> OFF sequence.
+    // A repeated APPLY used to set ERROR even though timing was accepted.
+    wr(16'h000c, 500); wr(16'h0010, 250);
+    wr(16'h0004, 0); wr(16'h0014, 1); idle();
+    rd(16'h0008, value); if (value != 16) $fatal(1, "OFF timing update set ERROR");
+    rd(16'h0020, value); if (value != 500) $fatal(1, "1 MHz period mismatch");
+    rd(16'h0024, value); if (value != 250) $fatal(1, "50 percent HIGH mismatch");
+    wr(16'h0004, 1); wr(16'h0014, 1); idle();
+    rd(16'h0008, value); if (value != 22) $fatal(1, "ON status mismatch");
+    waveform(1000, 500, 3); stop();
+    rd(16'h0008, value); if (value != 20) $fatal(1, "OFF status mismatch");
+    wr(16'h0014, 2); idle();
+    rd(16'h0008, value); if (value != 16) $fatal(1, "RESET status mismatch");
+    // Two GPIO synchronizers, the v10 final pair register and ODDR can need
+    // four fast clocks from an arbitrary input transition. Allow one margin.
+    gpio_dir = 1; gpio_data = 1; #20;
     if (pin_data !== 1 || pin_dir !== 1) $fatal(1, "Normal GPIO passthrough failed");
-    gpio_data = 0; #12;
+    gpio_data = 0; #20;
 
     // Saved GPIO data may be HIGH while its direction is IN. On claiming it,
     // the output driver must first see LOW, not leak a pre-start HIGH pulse.
@@ -127,6 +162,11 @@ module tb_pulse_gen;
     start(8, 2); waveform(8, 2, 20); stop();
     start(8, 6); waveform(8, 6, 20); stop();
     start(24, 12); waveform(24, 12, 20); stop();
+    start(500, 250); waveform(500, 250, 20); stop();
+    // Exercise low-byte carry and the carry into phase[23:16], including
+    // odd HIGH half-cycle counts and the registered terminal lookahead.
+    start(520, 258); waveform(520, 258, 4); stop();
+    start(131080, 65538); waveform(131080, 65538, 2); stop();
     start(1000, 250); waveform(1000, 250, 10);
 
     // Live timing updates are rejected and leave the running waveform intact.
@@ -154,7 +194,7 @@ module tb_pulse_gen;
     wr(16'h000c, 14); wr(16'h0010, 7); wr(16'h0014, 1, 1);
     fast_run = 1; idle();
     rd(16'h0020, value); if (value != 10) $fatal(1, "Busy request overwrote mailbox");
-    wr(16'h0014, 2); idle(); gpio_data = 1; #12;
+    wr(16'h0014, 2); idle(); gpio_data = 1; #20;
     if (pin_data !== 1 || pin_dir !== 1) $fatal(1, "Reset did not return GPIO ownership");
     rd(16'h0020, value); if (value != 500000) $fatal(1, "Reset default mismatch");
     rd(16'h00fc, value, 1);
@@ -166,7 +206,7 @@ module tb_pulse_gen;
     if (pin_data !== 0) $fatal(1, "ODDR asynchronous reset failed");
     fast_run = 1; arstn = 1; #48; idle();
     rd(16'h0008, value); if ((value & 15) != 0) $fatal(1, "Reset did not clear state");
-    $display("tb_pulse_gen: PASS"); $finish;
+    $display("tb_pulse_gen: PASS (BUS_HOLD_CYCLES=%0d)", bus_hold_cycles); $finish;
   end
-  initial begin #100000; $fatal(1, "Testbench watchdog timeout"); end
+  initial begin #1000000; $fatal(1, "Testbench watchdog timeout"); end
 endmodule

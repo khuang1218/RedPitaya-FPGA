@@ -44,6 +44,12 @@ module tdc_top #(
     ST_CAPTURE,
     ST_START_ENCODE,
     ST_WAIT_ENCODE,
+    ST_MULTIPLY,
+    ST_PARTIAL_SUM,
+    ST_PRODUCT_SUM,
+    ST_SELECT_FINE,
+    ST_SUBTRACT_LOW,
+    ST_SUBTRACT_HIGH,
     ST_CALCULATE,
     ST_PUSH,
     ST_WAIT_LOW
@@ -61,6 +67,32 @@ module tdc_top #(
   (* ASYNC_REG = "TRUE" *) logic return_sync;
   logic [NUM_TAPS-1:0] sampled_taps;
   logic [NUM_TAPS-1:0] captured_taps;
+  logic core_rstn;
+  // Break the 512-tap event reduction before it reaches controller enables.
+  // The two-stage tap delay matches the two-stage reduction, so captured_taps
+  // and the timestamp adjustment below still describe the same FDRE sample.
+  localparam int unsigned EVENT_GROUP_SIZE=32;
+  localparam int unsigned EVENT_GROUPS=(NUM_TAPS+EVENT_GROUP_SIZE-1)/EVENT_GROUP_SIZE;
+  logic [EVENT_GROUPS-1:0] event_group_nonzero;
+  logic legacy_sample_nonzero;
+  logic [1:0] legacy_timeout_pipe;
+  (* SHREG_EXTRACT="NO" *) logic [NUM_TAPS-1:0] legacy_taps_d1, legacy_taps_d2;
+  always_ff @(posedge clk_i) begin
+    legacy_taps_d1<=sampled_taps;
+    legacy_taps_d2<=legacy_taps_d1;
+    if (!core_rstn) legacy_sample_nonzero<=0;
+    else legacy_sample_nonzero<=|event_group_nonzero;
+  end
+  for (genvar group_index=0; group_index<EVENT_GROUPS; group_index=group_index+1) begin : gen_event_group
+    localparam int unsigned GROUP_WIDTH=
+      (NUM_TAPS-group_index*EVENT_GROUP_SIZE<EVENT_GROUP_SIZE) ?
+       NUM_TAPS-group_index*EVENT_GROUP_SIZE : EVENT_GROUP_SIZE;
+    always_ff @(posedge clk_i) begin
+      if (!core_rstn) event_group_nonzero[group_index]<=0;
+      else event_group_nonzero[group_index]<=
+        |sampled_taps[group_index*EVENT_GROUP_SIZE +: GROUP_WIDTH];
+    end
+  end
 
   logic enable;
   logic continuous;
@@ -91,7 +123,6 @@ module tdc_top #(
   logic [31:0] clock_period_ps;
   logic [31:0] calibration_target;
   logic calibration_complete;
-  logic core_rstn;
   logic width_busy, width_select;
   logic [31:0] legacy_rdata, width_rdata;
   logic legacy_ack, legacy_err, width_ack, width_err;
@@ -116,6 +147,13 @@ module tdc_top #(
   logic [31:0] wait_counter;
   logic [31:0] idle_period_counter;
   logic [31:0] launch_countdown;
+  // Delay timeout by the same two clocks as event detection, preserving
+  // acceptance of samples from the last two original observation clocks.
+  always_ff @(posedge clk_i) begin
+    if (!core_rstn || state!=ST_WAIT_RETURN) legacy_timeout_pipe<=0;
+    else legacy_timeout_pipe<={legacy_timeout_pipe[0],
+      wait_counter>=timeout_cycles-1'b1};
+  end
 
   logic encoder_start;
   logic encoder_busy;
@@ -129,6 +167,10 @@ module tdc_top #(
   logic [63:0] approximate_fine_product;
   logic [63:0] coarse_time_product;
   logic [63:0] calculated_total_ps;
+  logic [31:0] product00, product01, product10, product11;
+  logic [INDEX_W+15:0] fine_product_lo, fine_product_hi;
+  logic [63:0] product_sum_a, product_sum_b;
+  logic [32:0] total_low;
 
   logic [31:0] last_coarse;
   logic [INDEX_W-1:0] last_fine_raw;
@@ -351,22 +393,9 @@ module tdc_top #(
     .calibration_complete_i      (calibration_complete)
   );
 
-  always_comb begin
-    approximate_fine_product = captured_fine_raw * clock_period_ps;
-    if (use_calibration)
-      selected_fine_ps = calibration_lookup_data;
-    else
-      selected_fine_ps = approximate_fine_product / NUM_TAPS;
-
-    if (captured_status[6])
-      selected_fine_ps = 16'd0;
-
-    coarse_time_product = capture_coarse * clock_period_ps;
-    if (coarse_time_product >= selected_fine_ps)
-      calculated_total_ps = coarse_time_product - selected_fine_ps;
-    else
-      calculated_total_ps = 64'd0;
-  end
+  // Arithmetic is sequenced after encoding below. Four independent 16x16
+  // products avoid a chained 32x32 multiplier followed by a 64-bit subtract
+  // on one bus clock. No changes to the legacy FIFO/result representation.
 
   always_ff @(posedge clk_i) begin
     if (!core_rstn) begin
@@ -407,6 +436,11 @@ module tdc_top #(
       event_count         <= 32'd0;
       error_count         <= 32'd0;
       calibration_complete <= 1'b0;
+      product00<=0; product01<=0; product10<=0; product11<=0;
+      fine_product_lo<=0; fine_product_hi<=0;
+      product_sum_a<=0; product_sum_b<=0;
+      approximate_fine_product<=0; coarse_time_product<=0;
+      selected_fine_ps<=0; calculated_total_ps<=0; total_low<=0;
     end else begin
       coarse_counter      <= coarse_counter + 1'b1;
       encoder_start       <= 1'b0;
@@ -442,7 +476,10 @@ module tdc_top #(
           if (idle_period_counter != 32'hffff_ffff)
             idle_period_counter <= idle_period_counter + 1'b1;
 
-          if (enable && !return_sync && !(|sampled_taps) &&
+          // A short return/encode path may finish before a wide launch.
+          // Wait for its countdown to finish before starting another pulse;
+          // otherwise re-arming reloads the countdown and stretches HIGH.
+          if (enable && !launch_internal && !return_sync && !legacy_sample_nonzero &&
               !(calibration_mode && (histogram_clear_busy || calibration_complete))) begin
             if (calibration_mode || internal_test_enable || mmcm_sweep_enable) begin
               // Internal-test and MMCM-sweep single/continuous mode wait for
@@ -473,19 +510,20 @@ module tdc_top #(
 
         ST_WAIT_RETURN: begin
           wait_counter <= wait_counter + 1'b1;
-          if (|sampled_taps) begin
-            captured_taps  <= sampled_taps;
+          if (legacy_sample_nonzero) begin
+            captured_taps  <= legacy_taps_d2;
             // sampled_taps is an FDRE bank.  The controller observes that
-            // bank one clk_i edge after the actual thermometer capture.
-            capture_coarse <= coarse_counter - launch_counter - 32'd1;
+            // bank after its original observation clock plus two matched
+            // reduction/data pipeline clocks.
+            capture_coarse <= coarse_counter - launch_counter - 32'd3;
             state          <= ST_CAPTURE;
-          end else if (wait_counter >= timeout_cycles-1'b1) begin
+          end else if (legacy_timeout_pipe[1]) begin
             captured_taps     <= sampled_taps;
             captured_fine_raw <= '0;
-            capture_coarse    <= coarse_counter - launch_counter;
+            capture_coarse    <= coarse_counter - launch_counter - 32'd2;
             captured_status   <= STATUS_TIMEOUT;
             error_count       <= error_count + 1'b1;
-            state             <= ST_CALCULATE;
+            state             <= ST_MULTIPLY;
           end
         end
 
@@ -506,17 +544,53 @@ module tdc_top #(
               event_count <= event_count + 1'b1;
               if (histogram_enable)
                 histogram_increment <= 1'b1;
-              if (calibration_mode && (calibration_target != 0) &&
-                  (event_count + 1'b1 >= calibration_target))
-                calibration_complete <= 1'b1;
             end else begin
               error_count <= error_count + 1'b1;
             end
-            state <= ST_CALCULATE;
+            state <= ST_MULTIPLY;
           end
         end
 
+        ST_MULTIPLY: begin
+          product00<=capture_coarse[15:0]*clock_period_ps[15:0];
+          product01<=capture_coarse[15:0]*clock_period_ps[31:16];
+          product10<=capture_coarse[31:16]*clock_period_ps[15:0];
+          product11<=capture_coarse[31:16]*clock_period_ps[31:16];
+          fine_product_lo<=captured_fine_raw*clock_period_ps[15:0];
+          fine_product_hi<=captured_fine_raw*clock_period_ps[31:16];
+          state<=ST_PARTIAL_SUM;
+        end
+        ST_PARTIAL_SUM: begin
+          product_sum_a<=64'(product00)+(64'(product01)<<16);
+          product_sum_b<=(64'(product10)<<16)+(64'(product11)<<32);
+          approximate_fine_product<=64'(fine_product_lo)+(64'(fine_product_hi)<<16);
+          state<=ST_PRODUCT_SUM;
+        end
+        ST_PRODUCT_SUM: begin
+          coarse_time_product<=product_sum_a+product_sum_b;
+          state<=ST_SELECT_FINE;
+        end
+        ST_SELECT_FINE: begin
+          selected_fine_ps<=captured_status[6] ? 16'd0 :
+            (use_calibration ? calibration_lookup_data : 16'(approximate_fine_product/NUM_TAPS));
+          state<=ST_SUBTRACT_LOW;
+        end
+        ST_SUBTRACT_LOW: begin
+          total_low<={1'b0,coarse_time_product[31:0]}-{17'd0,selected_fine_ps};
+          state<=ST_SUBTRACT_HIGH;
+        end
+        ST_SUBTRACT_HIGH: begin
+          calculated_total_ps<=(coarse_time_product[63:32]==0 && total_low[32]) ? 64'd0 :
+            {32'(coarse_time_product[63:32]-total_low[32]),total_low[31:0]};
+          state<=ST_CALCULATE;
+        end
         ST_CALCULATE: begin
+          // Histogram RMW now has two pipeline stages before its memory write.
+          // Publish calibration completion only after the arithmetic states
+          // have allowed the final increment to drain (event_count is current).
+          if (calibration_mode && (calibration_target != 0) &&
+              (event_count >= calibration_target))
+            calibration_complete <= 1'b1;
           sequence_counter <= sequence_counter + 1'b1;
           last_sequence    <= sequence_counter + 1'b1;
           last_status      <= captured_status;
@@ -552,7 +626,7 @@ module tdc_top #(
         end
 
         ST_WAIT_LOW: begin
-          if (!return_sync && !(|sampled_taps))
+          if (!return_sync && !legacy_sample_nonzero)
             state <= ST_IDLE;
         end
 

@@ -35,6 +35,9 @@ reg [1:0] reg_do_csff ;
 (* ASYNC_REG = "TRUE" *)
 reg reg_do      ;
 reg reg_done    ;
+// Snapshot the selected slave response before the completion toggle crosses.
+// This removes live slave/address mux logic from the PS return-data path.
+reg [31:0] reg_response;
 wire reg_we;
 wire reg_re;
 
@@ -71,7 +74,7 @@ assign ctrl_ack    = ctrl_done_csff[1] != ctrl_done_csff[2] ;
 
 assign bus_s.ack   = pll_locked_i ? ctrl_ack                 : 1'b1;
 assign bus_s.err   = pll_locked_i ? 1'b0                     : 1'b1;
-assign bus_s.rdata = pll_locked_i ? bus_m.rdata              : 32'hDEADBEEF;
+assign bus_s.rdata = pll_locked_i ? reg_response            : 32'hDEADBEEF;
 
 // latch control
 always @ (posedge bus_s.clk)
@@ -101,13 +104,16 @@ begin
     reg_do_csff <= 2'b0 ;
     reg_do      <= 1'b0 ;
     reg_done    <= 1'b0 ;
+    reg_response <= 32'd0;
     reg_we_csff <= 2'h0 ;
     reg_re_csff <= 2'h0 ;
   end else begin
     reg_do_csff <= {reg_do_csff[0], ctrl_do} ;
     reg_do      <=  reg_do_csff[1];
-    if (reg_ack_sync)
+    if (reg_ack_sync) begin
       reg_done <= reg_do ;
+      reg_response <= bus_m.rdata;
+    end
 
     reg_we_csff <= {reg_we_csff[0], ctrl_we} ;
     reg_re_csff <= {reg_re_csff[0], ctrl_re} ;

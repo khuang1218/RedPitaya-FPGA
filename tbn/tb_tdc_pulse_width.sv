@@ -1,14 +1,17 @@
 `timescale 1ns/1ps
 module tb_tdc_pulse_width #(
-  parameter bit FULL_SIZE=0
+  parameter bit FULL_SIZE=0,
+  parameter integer FULL_DEPTH=16384,
+  parameter integer FRAME_FAST_CYCLES=250
 );
   localparam integer TEST_CARRY4=FULL_SIZE ? 128 : 4;
-  localparam integer TEST_DEPTH=FULL_SIZE ? 16384 : 8;
+  localparam integer TEST_DEPTH=FULL_SIZE ? FULL_DEPTH : 8;
   reg bus_clk=0,fast_clk=0,rstn=0;
   always #4 bus_clk=~bus_clk;
   always #2 fast_clk=~fast_clk;
-  reg [31:0] addr=0,wdata=0,period=500;
+  reg [31:0] addr=0,wdata=0,period=2*FRAME_FAST_CYCLES;
   reg wen=0,ren=0,event_signal=0,marker=0,run=0,input_select=0,conflict=0;
+  integer bus_hold_cycles=2;
   wire [31:0] rdata;
   wire ack,err,busy;
   integer phase=0,pattern=0,trigger_number=0;
@@ -23,7 +26,7 @@ module tb_tdc_pulse_width #(
     .sys_rdata_o(rdata),.sys_ack_o(ack),.sys_err_o(err));
   always @(negedge fast_clk) begin
     marker=run && phase==0;
-    if(run) phase=(phase==249) ? 0 : phase+1; else phase=0;
+    if(run) phase=(phase==FRAME_FAST_CYCLES-1) ? 0 : phase+1; else phase=0;
   end
   always @(posedge fast_clk) if(marker) begin
     trigger_number=trigger_number+1;
@@ -33,6 +36,7 @@ module tb_tdc_pulse_width #(
           0: width_value=102; 1: width_value=246;
           2: width_value=502; 3: width_value=802;
         endcase
+        width_value=width_value*FRAME_FAST_CYCLES/250.0;
         #11; event_signal=1; #(width_value); event_signal=0;
       end
       1: begin end // no response
@@ -50,9 +54,17 @@ module tb_tdc_pulse_width #(
     event_signal=1;#246;event_signal=0;
   end
   task automatic wr(input [7:0] offset,input [31:0] value,input bit bad=0);
+    reg accepted_request,accepted_abort;
     @(negedge bus_clk);addr={24'h407101,offset};wdata=value;wen=1;
     @(posedge bus_clk);#0.01;
     if(!ack || err!==bad) $fatal(1,"Write %h err=%b expected=%b",offset,err,bad);
+    accepted_request=dut.request_toggle;accepted_abort=dut.abort_toggle;
+    repeat(bus_hold_cycles-1) begin
+      @(posedge bus_clk);#0.01;
+      if(!ack || err!==bad) $fatal(1,"Held write %h response changed",offset);
+      if(dut.request_toggle!==accepted_request || dut.abort_toggle!==accepted_abort)
+        $fatal(1,"Held write %h repeated a command",offset);
+    end
     @(negedge bus_clk);wen=0;
     @(negedge bus_clk);
   endtask
@@ -61,6 +73,10 @@ module tb_tdc_pulse_width #(
     @(posedge bus_clk);#0.01;
     if(!ack || err!==bad) $fatal(1,"Read %h err=%b expected=%b",offset,err,bad);
     value=rdata;
+    repeat(bus_hold_cycles-1) begin
+      @(posedge bus_clk);#0.01;
+      if(!ack || err!==bad || rdata!==value) $fatal(1,"Held read %h response changed",offset);
+    end
     @(negedge bus_clk);ren=0;
     repeat(4) @(negedge bus_clk);
     if(rdata!==value) $fatal(1,"Read response was not retained after request");
@@ -82,13 +98,19 @@ module tb_tdc_pulse_width #(
   task automatic record_at(input integer index,output [31:0] flags,output [31:0] ps);
     reg [31:0] sequence_value,coarse,raw;
     wr(8'h18,index);
-    rd(8'h1c,sequence_value);rd(8'h20,flags);rd(8'h24,coarse);rd(8'h28,raw);rd(8'h34,ps);
+    // Match the documented v8 bank/scale/correction readout latency.
+    repeat(8) @(negedge bus_clk);
+    // Read width FIRST after selecting each address. This catches stale
+    // multiply/correction pipeline data that later word reads could conceal.
+    rd(8'h34,ps);rd(8'h1c,sequence_value);rd(8'h20,flags);rd(8'h24,coarse);rd(8'h28,raw);
     if(sequence_value!=index+1) $fatal(1,"Sequence mismatch %d %d",sequence_value,index);
     if(flags[0] && flags[8] && ps!=coarse*4000) $fatal(1,"Coarse width mismatch");
   endtask
   reg [31:0] status,value,flags,ps;
   integer expected_ps;
   initial begin
+    if($value$plusargs("BUS_HOLD_CYCLES=%d",bus_hold_cycles)) begin end
+    if(bus_hold_cycles<1) $fatal(1,"BUS_HOLD_CYCLES must be positive");
     #120;rstn=1;repeat(12) @(negedge bus_clk);
     rd(0,value);if(value!=32'h50574201) $fatal(1,"ID");
     rd(8'h10,value);if(value!=TEST_DEPTH) $fatal(1,"Capacity");
@@ -105,11 +127,12 @@ module tb_tdc_pulse_width #(
           0:expected_ps=102000;1:expected_ps=246000;
           2:expected_ps=502000;3:expected_ps=802000;
         endcase
+        expected_ps=expected_ps*FRAME_FAST_CYCLES/250;
         if(!flags[0]||!flags[8]||ps<expected_ps-4000||ps>expected_ps+4000)
           $fatal(1,"Full-size RAM record %d flags=%h ps=%d expected=%d",i,flags,ps,expected_ps);
       end
       wr(8'h18,TEST_DEPTH,1);
-      $display("tb_tdc_pulse_width: PASS (production 512-tap/16384-record RAM dimensions, online encoding, all record addresses; ideal delays)");
+      $display("tb_tdc_pulse_width: PASS (%0d taps / %0d records, %0d ns frames, online encoding, all requested record addresses; ideal delays)",TEST_CARRY4*4,TEST_DEPTH,FRAME_FAST_CYCLES*4);
       $finish;
     end
     wr(8'h0c,0,1);wr(8'h0c,9,1);wr(8'h40,2,1);
@@ -143,13 +166,30 @@ module tb_tdc_pulse_width #(
       if(!flags[0] || !flags[9] || flags[8]) $fatal(1,"Calibrated flags %h",flags);
       if(ps<expected_ps-1000 || ps>expected_ps+1000) $fatal(1,"Fine correction %d vs %d",ps,expected_ps);
     end
+    // Both signed extremes must survive compact storage and bus reconstruction.
+    for(integer polarity=0;polarity<2;polarity=polarity+1) begin
+      for(integer i=0;i<32;i=i+1) begin
+        wr(8'h38,i);wr(8'h3c,((i<16)==(polarity==0)) ? 65535 : 0);
+      end
+      wr(8'h40,2);arm(4,0);wait_done(status);run=0;
+      for(integer i=0;i<4;i=i+1) begin
+        record_at(i,flags,ps);rd(8'h24,value);
+        expected_ps=value*4000 + ((polarity==0) ? 65535 : -65535);
+        if(!flags[0] || !flags[9] || flags[8] || ps!=expected_ps)
+          $fatal(1,"Signed correction lost polarity=%d got=%d expected=%d flags=%h",polarity,ps,expected_ps,flags);
+      end
+    end
+    record_at(0,flags,ps);expected_ps=ps;
+    wr(8'h38,0);wr(8'h3c,12345);wr(8'h38,16);wr(8'h3c,23456);wr(8'h40,4);
+    record_at(0,flags,ps);
+    if(!flags[9] || ps!=expected_ps) $fatal(1,"LUT edit changed frozen calibrated result");
     input_select=1;repeat(3) @(negedge bus_clk);
     rd(8'h40,value);if(value[0]||value[2]) $fatal(1,"Source change retained calibration");
     arm(2,1);wait_done(status);run=0;
     record_at(0,flags,ps);if(flags[0]||!flags[1]||!flags[2]||ps!=0) $fatal(1,"Missing pulse");
     arm(2,2);wait_done(status);run=0;event_signal=0;
     record_at(0,flags,ps);if(flags[0]||!flags[2]||!flags[11]) $fatal(1,"Missing fall/saturation");
-    record_at(1,flags,ps);if(flags[0]||!flags[3]) $fatal(1,"HIGH at cycle start");
+    record_at(1,flags,ps);if(flags[0]||!flags[1]||!flags[2]) $fatal(1,"Held HIGH has no new pulse");
     arm(2,3);wait_done(status);run=0;
     record_at(0,flags,ps);if(flags[0]||!flags[4]) $fatal(1,"Extra pulse");
     arm(1,4);wait_done(status);run=0;
@@ -179,18 +219,18 @@ module tb_tdc_pulse_width #(
     end
     arm(2,6);wait_done(status);run=0;
     record_at(0,flags,ps);
-    if(flags[0]||!flags[10]||flags[2]||ps!=0) $fatal(1,"Boundary fall RAM/flags %h",flags);
+    if(flags[0]||!flags[2]) $fatal(1,"V12 must reject a fall beyond the frame %h",flags);
     // Stall processing deliberately: the raw ring must flag overflow instead
     // of overwriting a frame or returning a plausible but corrupt burst.
-    arm(8,0);force dut.encoder_done=0;
-    wait_done(status);run=0;release dut.encoder_done;
+    arm(8,0);force dut.rise_encoder_done=0;force dut.fall_encoder_done=0;
+    wait_done(status);run=0;release dut.rise_encoder_done;release dut.fall_encoder_done;
     if(!status[7]) $fatal(1,"Staging overflow was not reported");
     rd(8'h14,value);if(value!=0) $fatal(1,"Overflow exposed partial results");
     arm(1,0);wait_done(status);run=0;record_at(0,flags,ps);
     if(!flags[0] || status[7]) $fatal(1,"Overflow/rearm failed");
     wr(8'h04,4);while(busy) @(negedge bus_clk);
     rd(8'h14,value);if(value!=0) $fatal(1,"Clear");
-    $display("tb_tdc_pulse_width: PASS (online burst, both edges, fine LUT, errors, watchdog, abort, staging overflow, boundary RAM writes, CDC readout; ideal delays)");
+    $display("tb_tdc_pulse_width: PASS (online burst, signed/frozen fine corrections, errors, watchdog, abort, staging overflow, boundary RAM writes, width-first CDC readout; ideal delays)");
     $finish;
   end
   initial begin #100000000; $fatal(1,"Watchdog");end

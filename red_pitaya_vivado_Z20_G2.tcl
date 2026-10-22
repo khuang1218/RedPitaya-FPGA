@@ -125,14 +125,17 @@ synth_ip [get_ips sync_fifo]
 add_files -fileset constrs_1      $path_sdc_prj/red_pitaya_G2.xdc
 if {$prj_name == "v0.94" && [lsearch -regexp $prj_defs {^SCOPE_ONLY(=|$)}] < 0} {
   add_files -fileset constrs_1 $path_sdc_prj/tdc_Z20_G2.xdc
+  add_files -fileset constrs_1 $path_sdc_prj/tdc_width_sampler_layout.xdc
   add_files -fileset constrs_1 $path_sdc_prj/pulse_gen_Z20_G2.xdc
   add_files -fileset constrs_1 $path_sdc_prj/bnet_reader_Z20_G2.xdc
   set_property used_in_synthesis false [get_files *tdc_Z20_G2.xdc]
   set_property used_in_implementation true [get_files *tdc_Z20_G2.xdc]
+  set_property used_in_synthesis false [get_files *tdc_width_sampler_layout.xdc]
+  set_property used_in_implementation true [get_files *tdc_width_sampler_layout.xdc]
   set_property used_in_synthesis false [get_files *pulse_gen_Z20_G2.xdc]
   set_property used_in_implementation true [get_files *pulse_gen_Z20_G2.xdc]
   set_property used_in_synthesis false [get_files *bnet_reader_Z20_G2.xdc]
-  set_property used_in_implementation true [get_files *bnet_reader_Z20_G2.xdc]
+  set_property used_in_implementation [expr {[lsearch -regexp $prj_defs {^DISABLE_BNET(=|$)}] < 0}] [get_files *bnet_reader_Z20_G2.xdc]
   if {[file exists $path_sdc_prj/tdc_placement_selected.xdc]} {
     add_files -fileset constrs_1 $path_sdc_prj/tdc_placement_selected.xdc
     set_property used_in_synthesis false [get_files *tdc_placement_selected.xdc]

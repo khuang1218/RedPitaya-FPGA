@@ -499,8 +499,6 @@ module butterfly_static_sdf_stage #(
   logic signed [OUT_DW-1:0] y1_delay_dout;
   logic signed [OUT_DW-1:0] y1_delay_din;
   logic y1_delay_we;
-  logic signed [ACC_DW-1:0] calc_acc_y0;
-  logic signed [ACC_DW-1:0] calc_acc_y1;
   logic signed [OUT_DW-1:0] calc_y0;
   logic signed [OUT_DW-1:0] calc_y1;
 
@@ -528,11 +526,15 @@ module butterfly_static_sdf_stage #(
   logic signed [2*WEIGHT_DW-1:0] p1_weight_a;
   logic signed [2*WEIGHT_DW-1:0] p1_weight_b;
   logic signed [OUT_DW-1:0] p1_y1_from_delay;
+  logic calc_valid, calc_second_half, calc_emit_y1, calc_last_input;
+  logic [DELAY_AW-1:0] calc_delay_addr;
+  logic signed [OUT_DW-1:0] calc_saved_y1;
 
-  // DELAY_LEN 1 and 2 can read a y1 address on the same cycle that the
-  // read-first delay RAM writes it. Forward those short-delay values directly
-  // so a stale value from the previous group is never replayed.
-  logic signed [OUT_DW-1:0] y1_short_delay [0:1];
+  // Small feedback delays would read RAM before the deeper math pipeline
+  // commits y1. Read the forwarding bank at the aligned calculation stage
+  // instead, after the preceding group's y1 has been written. Drain still
+  // reads the ordinary delay RAM after all calculation writes have committed.
+  logic signed [OUT_DW-1:0] y1_short_delay [0:3];
 
   function automatic logic [DELAY_AW-1:0] delay_addr_from_sample;
     input logic [ADDR_W-1:0] index;
@@ -606,18 +608,56 @@ module butterfly_static_sdf_stage #(
                                           (weight_bank_base + addr_a);
     weight_addr_b = weight_bank_base + addr_b;
 
-    calc_acc_y0 = $signed(mul_sample_weight(p1_sample_a, p1_weight_a[2*WEIGHT_DW-1:WEIGHT_DW])) +
-                  $signed(mul_sample_weight(p1_sample_b, p1_weight_b[2*WEIGHT_DW-1:WEIGHT_DW]));
-    calc_acc_y1 = $signed(mul_sample_weight(p1_sample_a, p1_weight_a[WEIGHT_DW-1:0])) +
-                  $signed(mul_sample_weight(p1_sample_b, p1_weight_b[WEIGHT_DW-1:0]));
-    calc_y0 = sat_to_out(round_shift(calc_acc_y0));
-    calc_y1 = sat_to_out(round_shift(calc_acc_y1));
-
-    y1_delay_we = p1_valid && p1_second_half;
+    y1_delay_we = calc_valid && calc_second_half;
     y1_delay_din = calc_y1;
   end
 
   generate
+    if (1'b1) begin : pipelined_math
+      // The routed failure was DSP -> sum -> round -> saturate -> BRAM in
+      // one 8 ns cycle. Keep each operation in its own registered stage.
+      // Four extra clocks fit feedback delays >=8; smaller stages use the
+      // forwarding bank at the same delayed calculation stage for correctness.
+      (* use_dsp="yes" *) logic signed [PROD_DW-1:0] product_aa, product_ba, product_ab, product_bb;
+      logic signed [ACC_DW-1:0] sum_y0, sum_y1, rounded_y0, rounded_y1;
+      logic signed [OUT_DW-1:0] result_y0, result_y1;
+      logic [3:0] valid_pipe, second_pipe, emit_pipe, last_pipe;
+      logic [DELAY_AW-1:0] addr_pipe [0:3];
+      logic signed [OUT_DW-1:0] saved_y1_pipe [0:3];
+      // Data registers need no reset: only the reset valid pipeline can
+      // authorize a write/output. This also permits DSP register inference.
+      always_ff @(posedge clk_i) begin
+        product_aa<=mul_sample_weight(p1_sample_a,p1_weight_a[2*WEIGHT_DW-1:WEIGHT_DW]);
+        product_ba<=mul_sample_weight(p1_sample_b,p1_weight_b[2*WEIGHT_DW-1:WEIGHT_DW]);
+        product_ab<=mul_sample_weight(p1_sample_a,p1_weight_a[WEIGHT_DW-1:0]);
+        product_bb<=mul_sample_weight(p1_sample_b,p1_weight_b[WEIGHT_DW-1:0]);
+        sum_y0<=ACC_DW'(product_aa)+ACC_DW'(product_ba);
+        sum_y1<=ACC_DW'(product_ab)+ACC_DW'(product_bb);
+        rounded_y0<=round_shift(sum_y0);
+        rounded_y1<=round_shift(sum_y1);
+        result_y0<=sat_to_out(rounded_y0);
+        result_y1<=sat_to_out(rounded_y1);
+        second_pipe<={second_pipe[2:0],p1_second_half};
+        emit_pipe<={emit_pipe[2:0],p1_emit_y1};
+        last_pipe<={last_pipe[2:0],p1_last_input};
+        addr_pipe[0]<=p1_delay_addr;
+        saved_y1_pipe[0]<=p1_y1_from_delay;
+        for (int stage=1; stage<4; stage=stage+1) begin
+          addr_pipe[stage]<=addr_pipe[stage-1];
+          saved_y1_pipe[stage]<=saved_y1_pipe[stage-1];
+        end
+        if (!rstn_i || soft_reset_i) valid_pipe<=0;
+        else valid_pipe<={valid_pipe[2:0],p1_valid};
+      end
+      assign calc_y0=result_y0;
+      assign calc_y1=result_y1;
+      assign calc_valid=valid_pipe[3];
+      assign calc_second_half=second_pipe[3];
+      assign calc_emit_y1=emit_pipe[3];
+      assign calc_last_input=last_pipe[3];
+      assign calc_delay_addr=addr_pipe[3];
+      assign calc_saved_y1=saved_y1_pipe[3];
+    end
     if (DELAY_LEN <= 64) begin : small_delays
       (* ram_style = "distributed" *) logic signed [IN_DW-1:0] x_delay_mem [0:DELAY_LEN-1];
       (* ram_style = "distributed" *) logic signed [OUT_DW-1:0] y1_delay_mem [0:DELAY_LEN-1];
@@ -626,10 +666,10 @@ module butterfly_static_sdf_stage #(
         if (!rstn_i || soft_reset_i) begin
           x_delay_dout <= '0;
           y1_delay_dout <= '0;
-          for (int i = 0; i < DELAY_LEN; i++) begin
-            x_delay_mem[i] <= '0;
-            y1_delay_mem[i] <= '0;
-          end
+          // Warmup suppresses y1 reads until a complete group has written
+          // the feedback bank; x is written during the first half before
+          // its matching second-half read. Reset storage is unnecessary
+          // and prevents these arrays from inferring distributed RAM.
         end else begin
           x_delay_dout <= x_delay_mem[delay_addr];
           y1_delay_dout <= y1_delay_mem[draining ? drain_addr : delay_addr];
@@ -639,7 +679,7 @@ module butterfly_static_sdf_stage #(
           end
 
           if (y1_delay_we) begin
-            y1_delay_mem[p1_delay_addr] <= y1_delay_din;
+            y1_delay_mem[calc_delay_addr] <= y1_delay_din;
           end
         end
       end
@@ -670,7 +710,7 @@ module butterfly_static_sdf_stage #(
         .din_a_i  ('0),
         .we_a_i   (1'b0),
         .dout_a_o (y1_delay_dout),
-        .addr_b_i (p1_delay_addr),
+        .addr_b_i (calc_delay_addr),
         .din_b_i  (y1_delay_din),
         .we_b_i   (y1_delay_we),
         .dout_b_o ()
@@ -720,8 +760,7 @@ module butterfly_static_sdf_stage #(
       p1_weight_a <= '0;
       p1_weight_b <= '0;
       p1_y1_from_delay <= '0;
-      y1_short_delay[0] <= '0;
-      y1_short_delay[1] <= '0;
+      for (int slot=0; slot<4; slot=slot+1) y1_short_delay[slot] <= '0;
       sample_o <= '0;
       sample_valid_o <= 1'b0;
       done_o <= 1'b0;
@@ -758,22 +797,22 @@ module butterfly_static_sdf_stage #(
         end
       end
 
-      if (p1_valid && p1_second_half) begin
+      if (calc_valid && calc_second_half) begin
         sample_o <= calc_y0;
         sample_valid_o <= 1'b1;
-        if (DELAY_LEN <= 2) begin
-          y1_short_delay[p1_delay_addr] <= calc_y1;
+        if (DELAY_LEN <= 4) begin
+          y1_short_delay[calc_delay_addr] <= calc_y1;
         end
-      end else if (p1_valid && p1_emit_y1) begin
-        if (DELAY_LEN <= 2) begin
-          sample_o <= y1_short_delay[p1_delay_addr];
+      end else if (calc_valid && calc_emit_y1) begin
+        if (DELAY_LEN <= 4) begin
+          sample_o <= y1_short_delay[calc_delay_addr];
         end else begin
-          sample_o <= p1_y1_from_delay;
+          sample_o <= calc_saved_y1;
         end
         sample_valid_o <= 1'b1;
       end
 
-      if (p1_valid && p1_last_input) begin
+      if (calc_valid && calc_last_input) begin
         draining <= 1'b1;
         drain_addr <= '0;
       end else if (draining) begin

@@ -341,7 +341,18 @@ end
 
 assign dac_trig = (!dac_rep && trig_in) || (dac_rep && |rep_cnt && (dly_cnt == 32'h0) && (cyc_cnt == 16'h0) && ~dac_do && !buf_cycle) ;
 
-assign dac_npnt_sub = dac_npnt - {1'b0,set_size_i,32'h0} - 1;
+// V12 timing repair: p + step - size - 1 = p + step + ~size,
+// modulo the original PNT_SIZE+1 bits. Compress three operands into two
+// before a single carry-propagating adder. No cached configuration, extra
+// clock, pointer-enable change, or altered wrap/start/stop priority.
+wire [PNT_SIZE:0] wrap_a = {1'b0,dac_pnt};
+wire [PNT_SIZE:0] wrap_b = {1'b0,set_step[RSZ+15:0],set_step_lo};
+wire [PNT_SIZE:0] wrap_c = ~{1'b0,set_size_i,32'h0};
+wire [PNT_SIZE:0] wrap_sum = wrap_a ^ wrap_b ^ wrap_c;
+wire [PNT_SIZE:0] wrap_carry =
+  ((wrap_a & wrap_b) | (wrap_a & wrap_c) | (wrap_b & wrap_c)) << 1;
+rp_asg_pointer_add #(.WIDTH(PNT_SIZE+1)) i_wrap_pointer_add (
+  .a_i(wrap_sum), .b_i(wrap_carry), .sum_o(dac_npnt_sub));
 assign dac_npnt_sub_neg = dac_npnt_sub[PNT_SIZE];
 
 // read pointer logic
@@ -357,7 +368,13 @@ end else begin
    end
 end
 
-assign dac_npnt = dac_do ? dac_pnt + {set_step[RSZ+15:0],set_step_lo} : dac_pnt;
+// Gate the pointer register, not the input to its wide arithmetic. When
+// dac_do=0 the pointer holds (or loads its start value), and dac_do remains
+// zero unless the higher-priority trigger starts it. The unused idle next
+// pointer therefore need not select dac_pnt. This removes dac_do from both
+// long add/subtract paths reported in the v11 implementation.
+rp_asg_pointer_add #(.WIDTH(PNT_SIZE+1)) i_next_pointer_add (
+  .a_i({1'b0,dac_pnt}), .b_i({1'b0,set_step[RSZ+15:0],set_step_lo}), .sum_o(dac_npnt));
 assign trig_done_o = !dac_rep && trig_in;
 // output frequency on trigger
 assign get_step_o = set_step;
@@ -434,4 +451,23 @@ rp_asg_axi #(
   .err_cnt_o       ( err_cnt_o         ),
   .transf_cnt_o    ( transf_cnt_o      )
 );
+endmodule
+
+// Short carry-select groups bound the pointer feedback carry depth.
+module rp_asg_pointer_add #(
+  parameter integer WIDTH=63,
+  parameter integer GROUP=16,
+  parameter integer COUNT=(WIDTH+GROUP-1)/GROUP
+)(input wire [WIDTH-1:0] a_i, b_i, output wire [WIDTH-1:0] sum_o);
+  wire [COUNT:0] carry;
+  assign carry[0]=1'b0;
+  genvar g;
+  generate for (g=0;g<COUNT;g=g+1) begin : gen_group
+    localparam integer W=(WIDTH-g*GROUP<GROUP) ? WIDTH-g*GROUP : GROUP;
+    (* KEEP="TRUE" *) wire [W:0] sum_zero, sum_one;
+    assign sum_zero={1'b0,a_i[g*GROUP +: W]}+{1'b0,b_i[g*GROUP +: W]};
+    assign sum_one={1'b0,a_i[g*GROUP +: W]}+{1'b0,b_i[g*GROUP +: W]}+1'b1;
+    assign carry[g+1]=sum_zero[W] | ((&sum_zero[W-1:0]) && carry[g]);
+    assign sum_o[g*GROUP +: W]=carry[g] ? sum_one[W-1:0] : sum_zero[W-1:0];
+  end endgenerate
 endmodule

@@ -33,6 +33,17 @@ module rp_decim #(
    output     [DW-1: 0] dec_dat_o          // decimated data
 );
 
+// Local configuration registers cut the reported indep_mode -> config mux ->
+// 17-bit compare -> 32-bit accumulator path. Set decimation/averaging before
+// ARM and allow one ADC clock to settle. Steady-state sample/valid latency and
+// accumulation arithmetic are unchanged; no timing exception is required.
+(* DONT_TOUCH="TRUE" *) reg [16:0] set_dec_local;
+(* DONT_TOUCH="TRUE" *) reg set_avg_local;
+always @(posedge adc_clk_i) begin
+   if (!adc_rstn_i) begin set_dec_local<=17'd1; set_avg_local<=1'b0; end
+   else begin set_dec_local<=set_dec_i; set_avg_local<=set_avg_en_i; end
+end
+
 //---------------------------------------------------------------------------------
 //  Decimate input data
 
@@ -69,7 +80,7 @@ dec_avg_div
    .clk_i(adc_clk_i) ,
    .rst_i(adc_rstn_i),
    .x_i(sum_uns)   , // numerator (dividend) [ XDW-1: 0]
-   .y_i(set_dec_i)     , // denominator (divisor)[ YDW-1: 0]   // Both input values must be unsigned !!!
+   .y_i(set_dec_local)     , // denominator (divisor)[ YDW-1: 0]   // Both input values must be unsigned !!!
    .dv_i(div_go)     , //ready to start division
    .q_o(div_out)   , // quotient [ XDW-1: 0]
    .dv_o(div_ok)     // result available
@@ -89,7 +100,7 @@ if (adc_rstn_i == 1'b0) begin
    sign_sr   <= 34'b0;
 end else begin
    sign_sr<={sign_sr[34-2:0],sign_curr}; // sign shift register
-   if(adc_dec_cnt >= set_dec_i && set_dec_i >= 17'd16) begin //save sign and sum 
+   if(adc_dec_cnt >= set_dec_local && set_dec_local >= 17'd16) begin //save sign and sum
       sign_curr <= adc_sum[32-1];
       sum_in    <= adc_sum;
       dat_got     <= 1'b1; //data was acquired
@@ -122,7 +133,7 @@ end else begin
       adc_dv_div <= 1'b0;
 end
 
-wire dec_valid = (adc_dec_cnt >= set_dec_i);
+wire dec_valid = (adc_dec_cnt >= set_dec_local);
 
 always @(posedge adc_clk_i)
 if (adc_rstn_i == 1'b0) begin
@@ -138,7 +149,7 @@ end else begin
       adc_sum   <= $signed(adc_sum) + $signed(dec_dat_i) ;
    end
 
-   case (set_dec_i & {17{set_avg_en_i}}) // allowed dec factors: 1,2,4,8; if 16 or greater, use divider
+   case (set_dec_local & {17{set_avg_local}}) // allowed dec factors: 1,2,4,8; if 16 or greater, use divider
       17'h0     : begin adc_dat <= dec_dat_i;          adc_dv <= dec_valid;  end // if averaging is disabled
       17'h1     : begin adc_dat <= adc_sum[15+0 :  0]; adc_dv <= dec_valid;  end
       17'h2     : begin adc_dat <= adc_sum[15+1 :  1]; adc_dv <= dec_valid;  end

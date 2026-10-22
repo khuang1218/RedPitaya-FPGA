@@ -79,7 +79,7 @@ module tdc_registers #(
   input  logic                    calibration_complete_i
 );
 
-  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_4306; // "TDC", v6: compact 16384-width bursts
+  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_430e; // "TDC", v14: v12 capture with fixed frame offset
 
   localparam logic [15:0] REG_ID_VERSION       = 16'h0000;
   localparam logic [15:0] REG_CONTROL          = 16'h0004;
@@ -132,11 +132,13 @@ module tdc_registers #(
   logic        mmcm_incdec_reg;
   logic [15:0] register_offset;
   logic        sys_en;
+  logic        sys_accept;
   logic        valid_read;
   logic        valid_write;
 
   assign register_offset = sys_addr_i[15:0];
   assign sys_en = sys_wen_i | sys_ren_i;
+  assign sys_accept = sys_en && !sys_ack_o;
 
   assign enable_o             = control_reg[0];
   assign continuous_o         = control_reg[2];
@@ -237,7 +239,7 @@ module tdc_registers #(
         irq_status_reg[1] <= 1'b1;
 
       // Requests remain asserted until ack.  Execute a write only once.
-      if (sys_wen_i && !sys_ack_o && valid_write) begin
+      if (sys_wen_i && sys_accept && valid_write) begin
         case (register_offset)
           REG_CONTROL: begin
             control_reg[0] <= sys_wdata_i[0];
@@ -311,11 +313,19 @@ module tdc_registers #(
       sys_rdata_o <= 32'd0;
     end else begin
       sys_ack_o <= sys_en;
-      sys_err_o <= sys_en && ((sys_ren_i && !valid_read) ||
+      if (!sys_en)
+        sys_err_o <= 1'b0;
+      else if (sys_accept)
+        // Validate once: accepted commands can change BUSY/ENABLE before
+        // the CDC bridge releases the request. Keep that response stable.
+        sys_err_o <= ((sys_ren_i && !valid_read) ||
                               (sys_wen_i && !valid_write) ||
                               (sys_addr_i[1:0] != 2'b00));
 
-      case (register_offset)
+      // Capture one response and retain it through the CDC return path,
+      // even when live status changes or the bus address moves while idle.
+      // Gating the read mux also avoids updating it on every idle clock.
+      if (sys_accept) case (register_offset)
         REG_ID_VERSION:      sys_rdata_o <= TDC_ID_VERSION;
         REG_CONTROL:         sys_rdata_o <= control_reg;
         REG_STATUS:          sys_rdata_o <= {10'd0, mmcm_ps_busy_i, mmcm_locked_i,

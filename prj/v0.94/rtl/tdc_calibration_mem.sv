@@ -37,6 +37,35 @@ module tdc_calibration_mem #(
 
   logic [INDEX_W-1:0] clear_index;
   logic [NUM_TAPS-1:0] inactive_bank_written;
+  logic histogram_read_pending, histogram_write_pending;
+  logic [INDEX_W-1:0] histogram_read_index, histogram_write_index;
+  logic [31:0] histogram_read_value, histogram_write_value;
+
+  // Separate indexed LUTRAM read, increment and memory write. The v11 routed
+  // path combined all three (13 levels, including eight CARRY4s). Forward both
+  // read/write hazards so consecutive increments of the same bin are exact.
+  always_ff @(posedge clk_i) begin
+    if (!rstn_i || histogram_clear_i || histogram_clear_busy_o) begin
+      histogram_read_pending<=0;
+      histogram_write_pending<=0;
+    end else begin
+      histogram_read_pending<=histogram_increment_i;
+      histogram_write_pending<=histogram_read_pending;
+      if (histogram_increment_i) begin
+        histogram_read_index<=histogram_index_i;
+        // Read-during-write bypass: memory returns the pre-write value.
+        histogram_read_value<=(histogram_write_pending && histogram_write_index==histogram_index_i) ?
+          histogram_write_value : histogram[histogram_index_i];
+      end
+      if (histogram_read_pending) begin
+        histogram_write_index<=histogram_read_index;
+        // The immediately preceding request may have updated this bin after
+        // its RAM snapshot was taken. Use that newer accumulated value.
+        histogram_write_value<=((histogram_write_pending && histogram_write_index==histogram_read_index) ?
+          histogram_write_value : histogram_read_value)+32'd1;
+      end
+    end
+  end
 
   assign inactive_bank_ready_o = &inactive_bank_written;
 
@@ -81,8 +110,8 @@ module tdc_calibration_mem #(
         end else begin
           clear_index <= clear_index + 1'b1;
         end
-      end else if (histogram_increment_i) begin
-        histogram[histogram_index_i] <= histogram[histogram_index_i] + 1'b1;
+      end else if (histogram_write_pending) begin
+        histogram[histogram_write_index] <= histogram_write_value;
       end
     end
   end
