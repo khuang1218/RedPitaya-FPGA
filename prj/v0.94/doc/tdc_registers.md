@@ -5,15 +5,183 @@ It coexists with BNET and the GPIO pulse generator in system-bus slot 7.
 Current workspace setup, validation and next actions are in the
 [master handover](../../../../../RedPitaya_app/HANDOVER.md).
 
-**Current source interface v14 (v12-derived fixed frame offset):** the `TDC:WIDTH:*` path measures PCB HIGH pulse
+**Current source interface V18 (SINGLE reset default and targeted timing repair):** the `TDC:WIDTH:*` path measures PCB HIGH pulse
 width in finite bursts. It uses the actual pulse_gen cycle marker and a
 separate 250 MHz rising-polarity carry samplers for the two pulse edges. The legacy commands/registers below retain
 their earlier launch-to-rising-edge meaning. Use the new width procedure for
 the PCB's voltage-dependent output duration.
 
-## PCB pulse-width acquisition (v14 / PWB v1, 16384 records)
+## PCB pulse-width acquisition (V18 / PWB v1, 16384 records)
 
-### V14 fixed frame offset (current source; implementation pending)
+### V18: retain V17 capture, repair launch/control timing
+
+ID **0x54444312 / VERSION18**. FPGA reset now selects **SINGLE / DIO2_P**;
+LVDS remains explicitly selectable. Soft reset still preserves the selection.
+The V17 250 MHz sampler, 40 ns minimum frame, encoder, LUT arithmetic, 16384
+record capacity, offsets and six-field ABI are retained. Existing V16/V17
+minimum-period/diagnostic API and SCPI commands remain compatible.
+
+V17 demonstrated a selected 16384-pulse calibrated 25 MHz burst (655.36 us),
+but needed five starts. Its accepted burst had 305 ps SD and +2.45 ns nominal
+width bias; short-pulse means shifted by over 2 ns between starts. This is
+finite-burst functionality, not accurate continuous streaming qualification.
+V17 routed timing still failed: WNS -0.308 ns, 11 setup endpoints, no hold
+failures. Small burst SD and passing LUT arithmetic do not remove those limits.
+
+V18 separates ODDR-only data registers from fabric marker feedback, registers
+two terminal-comparison halves, and predecodes the minimum-period mailbox seed.
+The logical pulse/marker latency is unchanged. After the first V18 route,
+the pulse HIGH comparison was split into parallel byte groups to shorten the
+remaining phase-to-output path. The initial 2.5 ns ODDR placement target was
+removed: SAME_EDGE captures both D inputs on a rising edge, and their real
+setup/hold checks now use the 250 MHz clock, including clock skew and jitter.
+There is no ODDR data timing exception. The new seed uses the documented
+request-held mailbox bound.
+Targeted MAX_FANOUT hints address WIDTH state, dispatch and staging routes.
+No carry/encoder/width-math redesign or global clock-pair exception was added.
+
+Build externally with `scripts/build_tdc_v18.tcl` in the existing project, or
+refresh sources using `scripts/refresh_custom_sources.tcl` and rebuild manually.
+The V18 build helper archives prior reports/bitstreams, saves new timing/CDC/DRC
+reports, and stops before bitstream generation if setup/hold timing is negative.
+No V18 timing-closure or hardware-accuracy result is claimed until that build
+and the new `tdc_rigol_v18_25mhz_characterisation.ipynb` run complete. Collect
+fresh RISE/FALL LUTs for the new implementation; do not assume V17 tables apply.
+
+### V17: 25 MHz frame initiation and V16 timing repairs
+
+ID **0x54444311 / VERSION17**. The sampling clock remains250 MHz, coarse tick
+4000 ps, capacity16384, and all six result fields/PWBv1 unchanged. Hardware
+minimum at0x144 is **40 ns /25 MHz**, meaning one new frame every10 clocks.
+Total decode/result latency is longer than one frame and is explicitly drained
+before completion. Full-capacity periods span655.36 microseconds; acquisition
+is a finite burst, not continuous streaming/readout.
+
+The supplied V16 route (October22,23:10:12) failed WNS-0.635 ns/TNS-17.879 ns,
+198 setup endpoints,0 hold.184 failures were in the250 MHz domain, with worst
+paths from encoder shift registers into32-lane chunk prefix/population logic.
+Four125 MHz ASG pointer endpoints and ten asynchronous recovery endpoints in
+the pulse generator also failed. PS AXI200 MHz now passed with+0.050 ns WNS.
+This is V16 evidence; no new V17 routed timing is available.
+
+WIDTH now uses two `tdc_population_pipeline` encoders. Each binary-tree level
+is registered; default512-tap latency is12 clocks and the encoder can accept a
+snapshot every clock. Raw population, three-tap majority validation, <=8-tap
+transition span, saturation/status flags and rank meaning are preserved.
+Legacy launch-to-return commands retain the iterative encoder unchanged.
+
+Raw-frame dispatch is independent of result processing. Four queued raw slots
+are released after dispatch; metadata follows encoder validity through the
+fixed-latency pipeline. The nine-clock signed width arithmetic accepts a new
+decoded frame every10 clocks. Ring overflow, missing/extra encoder completion
+or result overlap fails with DONE|OVERFLOW and publishes no records. Abort,
+clear, source changes and rearm flush in-flight validity; the drain fence covers
+all results and bank-local writes. Sparse diagnostic ticks remain available.
+
+The pulse generator now has an active-high asynchronous ODDR reset FF directly
+connected to R, removing the failing inverter path. Internal fast controls use
+a synchronous local reset leaf. ODDR asynchronous LOW and GPIO release on clock
+loss/reset remain. Only external reset assertion into the synchronizer PRE/CLR
+pins is exempt; functional reset release/ODDR R is timed. ASG pointer addition
+uses8-bit carry-select groups with a logarithmic group-carry prefix, preserving
+the exact combinational sum and pointer-cycle behavior. All are timing repair
+candidates; new routed timing, DRC, CDC, resource use and sampler placement must
+be checked externally. Additional tree registers/routing may affect placement.
+
+Minimum HIGH/LOW>=8 ns remains a sampled-level/coarse contract, not guaranteed
+fine interpolation. Fine validity also depends on line propagation history:
+an8.2 ns test pulse was rejected by the ideal10.24 ns full-chain model. The
+validator was retained. Initial25 MHz fine qualification uses12..28 ns HIGH,
+with both HIGH/LOW longer than the ideal test line. Actual routed/PVT delay
+coverage and hardware narrow-pulse performance require measurements.
+
+V16 API/SCPI already reads the minimum dynamically; **no new API ABI or SCPI
+commands are required**. VERSION? returns17 and MINIMUM:PERIOD? returns40 with
+the new image. API/actual-parser tests cover40 ns ARM/watchdog,36 ns rejection,
+and unchanged sparse diagnostics. The existing V16 notebook remains intact.
+Use the separate app notebook `tdc_rigol_25mhz_characterisation.ipynb`, which
+expects17, requires40 ns, keeps all calibration/integrity gates and records
+fresh25 MHz coarse/fine repeats, duty/rate coverage and full-capacity bursts.
+It first collects fresh LUTs using the established~1 MHz calibration settings;
+fresh25 MHz captures then test rate transfer. Enter the new routed WNS and
+restart the kernel; do not assign V16 WNS to V17 or reuse V16 LUTs.
+
+Offline checks passed: full16384-record512-tap40 ns acquisition with fine
+correction, all record addresses and256 sparse timestamp pairs; exhaustive
+16-tap encoder reference and17/512-tap patterns; consecutive encoder launches
+and reset flush; controller faults/overflow/abort/boundaries; legacy TDC;
+pulse restart/clock-loss reset with vendor ODDR; and independent ASG addition
+equivalence. These verify logic in ideal models, not physical precision,
+absolute bias, timing closure or demonstrated hardware25 MHz operation.
+
+Historical sections below describe the earlier versions, not the active source.
+
+### V16 throughput and timing repair (source; implementation pending)
+
+ID **0x54444310 / VERSION16**. At the unchanged 250 MHz sample clock,
+both WIDTH encoders scan 32 taps per clock (16 scan clocks for 512 taps).
+The conservative scan-plus-processing budget is 49 fast clocks; the hardware
+minimum frame is 50 clocks / **200 ns / 5 MHz**. Larger parameterized scans
+increase the minimum. This is finite-burst acquisition, not continuous readout.
+HIGH and LOW each need at least 8 ns for reliable sampled-level edge detection.
+
+V15's routed `last_one_end -> transition_span_ok` path failed by 12 ps.
+V16 registers the span subtraction before comparison, adding one processing
+clock without relaxing the <=8-tap transition validity rule. The two 200 MHz
+PS AXI converter setup failures (-23/-5 ps) remain timed and require new routed
+verification. No timing exceptions, sample/capture alignment or width formula
+were changed. Do not claim timing closure or improved physical precision from
+simulation. Recalibrate both edge LUTs after routing; broad distributions and
+narrow-pulse bias are still unresolved measurement issues.
+
+Sparse timestamps save both 32-bit internal sample ticks every 64 records,
+including record index0, across the entire burst (256 pairs at capacity).
+This adds 16384 diagnostic storage bits (64-bit ports may use one RAMB36), rather than
+widening every result. Check actual resource use after synthesis.
+The six-field width record ABI is unchanged. A VALID pair must satisfy
+`(fall_ticks-rise_ticks) mod 2^32 == coarse_ticks`. Invalid pairs are diagnostic
+only; use flags before interpreting them. Reconstruct relative edge motion as
+`unwrapped_ticks*4000 - edge_LUT[raw]`, then subtract nominal elapsed frames.
+This is internal timing, not an independent calibrated pin-arrival reference.
+Sparse samples can miss fast excursions; retain full width distributions.
+
+Rebuild API first and then the statically linked SCPI server. New commands:
+
+- `TDC:WIDTH:MINIMUM:PERIOD?`: hardware minimum frame period in ns (200 default).
+- `TDC:WIDTH:DIAGNOSTIC:CONFIG?`: `stride,capacity` (64,256 default).
+- `TDC:WIDTH:DIAGNOSTIC:EDGE? start_sample,count`: 1..128 sparse samples/query,
+  rows `cycle_id,rise_ticks,fall_ticks` separated by semicolons. Sample index
+  s selects width record index s*64, with cycle_id=s*64+1. Only completed idle
+  records may be read; range, read-ready and sequence checks remain active.
+
+The notebook now defaults to V16 with unknown WNS, extends common-rate coverage
+through 5 MHz, checks sparse tick/coarse association, and repeats drift tests
+without selecting on precision/bias. It keeps matched source/frame periods and
+all calibration/integrity gates. V14/V15 remain explicit helper options with
+their 500 ns minimum and no new diagnostic commands. Historical notes below
+describe their original builds and do not override V16 behavior.
+
+### V15 command-control timing repair (source only)
+
+ID **0x5444430f / VERSION15** distinguishes this repair from the loaded V14.
+The supplied October22 11:42 V14 routed report has WNS **-0.039ns**, TNS
+**-0.322ns**, 14 setup failures and no hold failures. All setup failures are
+in the 250MHz WIDTH domain; the ten detailed paths include request toggle/seen
+decode to `completed_fast` reset and `record_write_data` enable. These are
+ordinary timed paths, not exempt asynchronous carry measurement inputs.
+
+V15 registers start/abort command decoding before the wide control fanout,
+with self-inhibit to consume each mailbox toggle once. It adds one fast clock
+to command acceptance. Raw sample pipelines, edge timestamps, frame offsets,
+LUT arithmetic, 500ns minimum frame and ABI are unchanged. No timing exception
+is relaxed. This is a timing repair candidate, not a routed-closure result or
+an established cure for broad width distributions. Rebuild externally and
+inspect full timing/CDC/DRC before loading; do not run Vivado on this laptop.
+Retain the working V14 image and recalibrate both LUTs after any new route.
+The notebook remains configured for loaded V14; explicitly change its expected
+version to15 only after deploying and identifying the new image.
+
+### V14 fixed frame offset (retained interface and implementation history)
 
 V14 starts from the **v12-timing-r1** image whose October21 routed report met
 all specified timing constraints: WNS+0.031ns,0setup/hold failures,WIDTH250MHz
@@ -22,7 +190,7 @@ Its source, routed checkpoint, bitstream and report are saved in the app
 workspace at `build/hdl-review/20261022-v14/passing-v12-source/` and
 `passing-v12-build/`. V13's controller/record-format redesign is not restored.
 
-**New ID:0x5444430e, VERSION14.** Six-field records/PWBv1 and fine arithmetic
+**V14 ID:0x5444430e, VERSION14.** Six-field records/PWBv1 and fine arithmetic
 use the v12 layout. The existing 512-tap RISE/FALL samplers, population encoders,
 result buffers,250MHz sampling,16384capacity and500ns minimum frame remain.
 BNET stays excluded; single-ended input is the current focus, LVDS deferred.
@@ -48,7 +216,9 @@ latency, not just an independent AWG with matching frequency settings. Fixed
 offset compensates stable delay; clock drift or source restarts can change
 phase. The Rigol helper still restarts sources and uses its INT reference, so
 OFFSET alone does not synchronize that setup. Scope alignment must apply to
-the actual acquisition. Do not retry/filter failed frames into a pass.
+the actual acquisition. The user-authorized bench workflow may restart zero/partial
+bursts until complete, retaining all attempts. Never select/retry by width error
+or jitter; selected-burst completion does not establish unconditional efficiency.
 
 #### Timing structure and deployment
 
@@ -410,13 +580,15 @@ before software receives completion, so delayed/repeated reads are stable.
 The default capacity is **16384 records**, with a default requested count of 16.
 This matches the ADC buffer's record count, not its sampling rate. At 1 MHz,
 16384 pulse periods span **16.384 ms**; at 2 MHz they span **8.192 ms**,
+at 5 MHz **3.2768 ms**, and at25 MHz **655.36 microseconds**,
 plus initial alignment and final decoding.
 
 Only **four raw frames** are staged at once, with a separate capture controller
-and result processor. Each parallel width encoder consumes **eight taps per clock**,
-retaining the majority-filter validator and status bit layout. V12 WIDTH uses bounded
-population rank; the one-tap legacy encoder remains strict. At 512 taps, the scan takes 64 fast clocks per edge concurrently;
-the frame limit reserves additional clocks for processing and memory writes. A stalled processor raises OVERFLOW and discards the
+and result processor. V17's parallel width encoders use registered binary trees
+with12-clock latency and overlapping frame initiation. The bounded-population
+validator/status layout remains; the one-tap legacy encoder stays strict.
+The40 ns frame limit budgets initiation and result retirement, not total latency.
+A stalled/faulting processor raises OVERFLOW and discards the
 burst, rather than overwriting an unread frame silently.
 
 Each stored result is **99 bits** at 512 taps: flags, coarse ticks, two 9-bit
@@ -426,7 +598,7 @@ store a zero correction; invalid records still return width_ps=0. The correction
 is frozen per record, so later LUT edits cannot change a completed measurement.
 Cycle ID is derived from the address; the API still reads the same five 32-bit
 words and all public fields are preserved. The result buffer is **198 KiB**,
-plus a 560-byte raw-frame ring and 2 KiB of LUT data. The raw ring uses distributed
+plus a 560-byte raw-frame ring, 2 KiB of LUT data and V16's 2 KiB sparse diagnostic data. The raw ring uses distributed
 RAM; results use block RAM. This replaces the v5 scheme whose full raw snapshots
 would need about 2.44 MiB at this depth. Actual BRAM packing and the remaining
 resources in the merged BNET/scope/ASG design require an external utilization
@@ -465,11 +637,11 @@ inspect the new synthesis log and hierarchical utilization on the build machine.
 
 ### First-board sequence
 
-Rebuild/reload the FPGA. The installed v8 API/server already support this v12
-layout; older software may need the current API and statically linked SCPI
-server. Check `0x5444430c` at `0x40710000` and `0x50574201` at `0x40710100`.
-`TDC:WIDTH:VERSION?` reports 11 with the new image.
-`TDC:WIDTH:CAPACITY?` must return 16384 for the default v12 build. The v5/PWB v1
+Rebuild/reload the FPGA; the V16 API plus statically linked SCPI already supports
+V17. Check `0x54444311` at `0x40710000` and `0x50574201` at `0x40710100`.
+`TDC:WIDTH:VERSION?` reports17; `MINIMUM:PERIOD?` reports40 and
+`DIAGNOSTIC:CONFIG?` reports64,256 with the default build.
+`TDC:WIDTH:CAPACITY?` must return16384. The v5/PWB v1
 API register layout remains compatible; the updated script removes its old
 1024-record limit and understands the added overflow status.
 Start pulse_gen **before** width ARM, avoiding a network round-trip inside the
@@ -544,10 +716,14 @@ Offsets below are relative to TDC base `0x40710000` (not the pulse-generator bas
 | 0x138 | R/W | Width LUT address: rise 0..511, fall 512..1023 |
 | 0x13c | R/W | Width LUT entry, 0..65535 ps; idle only |
 | 0x140 | R/W | Write: 1 invalidate tables, 2 activate, 4 disable. Read: bit 0 enabled, bit 2 both tables fully written |
-| 0x144 | R | Minimum permitted trigger period: 500 ns by default (read the register) |
+| 0x144 | R | Minimum trigger period: V17 default40 ns; V16 default200 ns; V14/V15 default500 ns; read hardware |
 | 0x148 | R | v8+: bit 0 READ_READY; bank/readout arithmetic pipeline settled after selecting an index; zero during BUSY |
 | 0x158 | R/W | v14: acquisition frame offset in ns, idle only; multiple of4,0..262140,strictly less than launch period; FPGA-reset0 |
 | 0x15c | R | v14 frame-offset capability:0x46524d01 (FRM v1) |
+| 0x160 | R | V16 sparse-edge capability:0x44424701 (DBG v1) |
+| 0x164 | R | V16 diagnostic record stride:64 |
+| 0x168 | R | V16 selected record RISE tick; idle, completed index divisible by64, same READ_READY protocol |
+| 0x16c | R | V16 selected record FALL tick; same restrictions; 32-bit wrap |
 
 Status bits: 0 BUSY, 1 CAPTURING (including wait for first trigger), 2 PROCESSING,
 3 DONE, 4 TRIGGER_TIMEOUT, 5 RATE_ERROR, 6 ABORTED, 7 OVERFLOW (raw-frame ring).
@@ -764,7 +940,8 @@ LUT correction. It preserves other control settings. Wait for histogram clear
 completion before collecting calibration data; reload a LUT and characterize
 the offset for the selected input path before calibrated measurements.
 Rewriting the same selection while disabled/idle has no reset side effects.
-Soft reset preserves the external selection; FPGA reset restores LVDS.
+Soft reset preserves the external selection. FPGA reset selects SINGLE in V18;
+V17 and earlier reset to LVDS. Explicit LVDS selection remains available.
 
 Rebuild and load the FPGA image and rebuild/redeploy both the API and statically
 linked SCPI server. The new API rejects input selection on pre-v4 FPGA images.
@@ -818,7 +995,7 @@ encoding and re-arm time; LAUNCH_PERIOD is not a guaranteed waveform period.
 
 | Offset | Register | Access | Reset / description |
 |---:|---|---|---|
-| `0x00` | `ID_VERSION` | R | `0x5444430e` (`TDC`, v14: v12 capture + fixed frame offset) |
+| `0x00` | `ID_VERSION` | R | `0x54444311` (`TDC`, V17: 25 MHz frame initiation, registered encoder trees) |
 | `0x04` | `CONTROL` | R/W | Persistent and pulse control fields below |
 | `0x08` | `STATUS` | R | Live state and FIFO level fields below |
 | `0x0c` | `LAUNCH_PERIOD` | R/W | 125000 clocks (1 ms at 125 MHz); zero clamps to one |

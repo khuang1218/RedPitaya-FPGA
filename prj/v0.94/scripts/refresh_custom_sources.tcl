@@ -15,7 +15,7 @@ set custom_copy_root [file normalize [file join [get_property DIRECTORY $custom_
 
 set custom_module_names {
   pulse_gen.sv bnet_axi_reader_ch.sv butterfly_network_static_sdf.sv
-  tdc_top.sv tdc_registers.sv tdc_pulse_width.sv tdc_frame_delay.sv
+  tdc_top.sv tdc_registers.sv tdc_pulse_width.sv tdc_frame_delay.sv tdc_population_pipeline.sv
 }
 # Require the changed launch/register/capture modules explicitly. Refresh the
 # full TDC dependency set, including the internal and MMCM stimulus sources, to
@@ -129,6 +129,6 @@ if {!$custom_enable_bnet} {
   set_property verilog_define $custom_clean_defs $custom_sources
 }
 puts "BNET enabled: $custom_enable_bnet (set custom_enable_bnet 1 before sourcing to restore it)"
-puts "TDC v14 source: passing-v12 capture with fixed frame offset. ID 0x5444430e; deploy matching API/SCPI for TDC:WIDTH:OFFSET and recalibrate fresh LUTs. New routed WNS remains to be measured."
+puts "TDC V18 source: SINGLE reset default; V17 25 MHz capture/encoder datapath retained. Pulse launch routing/terminal timing repair and bounded control fanout. ID 0x54444312, minimum40 ns. Existing V16/V17 API/SCPI commands remain compatible. Collect fresh RISE/FALL LUTs after this route. Timing closure and hardware precision require new reports/tests."
 update_compile_order -fileset sources_1
 puts "Custom sources copied and verified under $custom_copy_root. Rerun this script after workspace edits to refresh the copies. Reset synthesis/implementation before rebuilding."

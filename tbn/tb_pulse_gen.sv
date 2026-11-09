@@ -92,10 +92,43 @@ module tb_pulse_gen;
     end
   endtask
 
+  reg [31:0] compare_phase, compare_high;
+  integer compare_index, compare_bit;
+  task automatic check_high_compare(input [31:0] p, input [31:0] h);
+    compare_phase=p & 32'hfffffffe;
+    compare_high=h;
+    #0.001;
+    if (dut.first_half_high !== (compare_phase < compare_high) ||
+        dut.pair_below_high !== (compare_phase[31:1] < compare_high[31:1]))
+      $fatal(1,"Grouped HIGH compare mismatch: phase=%h high=%h",compare_phase,compare_high);
+  endtask
+
   reg [31:0] value;
   initial begin
     if ($value$plusargs("BUS_HOLD_CYCLES=%d", bus_hold_cycles)) begin end
     if (bus_hold_cycles < 1) $fatal(1, "BUS_HOLD_CYCLES must be positive");
+    // Check odd/even HIGH boundaries and every byte/word carry, including
+    // the upper counter bits which a practical waveform run cannot reach.
+    // All forces are released while reset is still asserted.
+    force dut.phase=compare_phase;
+    force dut.active_high=compare_high;
+    for (compare_index=0; compare_index<256; compare_index=compare_index+1) begin
+      check_high_compare(32'(compare_index),32'(compare_index));
+      check_high_compare(32'(compare_index),32'(compare_index)+1);
+      check_high_compare(32'(compare_index),32'(compare_index)-1);
+    end
+    for (compare_bit=1; compare_bit<32; compare_bit=compare_bit+1) begin
+      check_high_compare((32'd1<<compare_bit)-2,(32'd1<<compare_bit)-1);
+      check_high_compare((32'd1<<compare_bit),(32'd1<<compare_bit));
+      check_high_compare((32'd1<<compare_bit),(32'd1<<compare_bit)+1);
+      check_high_compare((32'd1<<compare_bit)+2,(32'd1<<compare_bit)+1);
+    end
+    check_high_compare(32'hfffffffe,32'hffffffff);
+    check_high_compare(32'hfffffffe,32'hfffffffd);
+    for (compare_index=0; compare_index<10000; compare_index=compare_index+1)
+      check_high_compare($urandom,$urandom);
+    release dut.phase;
+    release dut.active_high;
     #19; arstn = 1; #48; idle();
     rd(0, value); if (value != 32'h50554c01) $fatal(1, "ID mismatch");
     // The PS bus bridge returns registered data several clocks after the
@@ -162,6 +195,9 @@ module tb_pulse_gen;
     start(8, 2); waveform(8, 2, 20); stop();
     start(8, 6); waveform(8, 6, 20); stop();
     start(24, 12); waveform(24, 12, 20); stop();
+    start(40, 12); waveform(40, 12, 20); stop();
+    start(40, 20); waveform(40, 20, 20); stop();
+    start(40, 28); waveform(40, 28, 20); stop();
     start(500, 250); waveform(500, 250, 20); stop();
     // Exercise low-byte carry and the carry into phase[23:16], including
     // odd HIGH half-cycle counts and the registered terminal lookahead.

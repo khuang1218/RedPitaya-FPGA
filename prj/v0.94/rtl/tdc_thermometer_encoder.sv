@@ -48,7 +48,8 @@ module tdc_thermometer_encoder #(
   logic                captured_all_zero;
   logic                captured_all_one;
   logic [INDEX_W:0] population, last_one_end;
-  logic decode_pending, transition_span_ok;
+  logic span_pending, decode_pending, transition_span_ok;
+  logic [INDEX_W:0] transition_span;
 
   logic [STEP-1:0] filtered_bits;
   logic [STEP-1:0] lane_valid, bubble_bits;
@@ -171,6 +172,8 @@ module tdc_thermometer_encoder #(
       scan_complete        <= 0;
       finish_pending       <= 0;
       decode_pending       <= 0;
+      span_pending         <= 0;
+      transition_span      <= 0;
       transition_span_ok   <= 0;
       population           <= 0;
       last_one_end         <= 0;
@@ -199,6 +202,7 @@ module tdc_thermometer_encoder #(
         scan_complete        <= 0;
         finish_pending       <= 0;
         decode_pending       <= 0;
+        span_pending         <= 0;
         transition_span_ok   <= 0;
         population           <= 0;
         last_one_end         <= 0;
@@ -239,9 +243,11 @@ module tdc_thermometer_encoder #(
           finish_pending <= 0;
           if (MAX_TRANSITION_SPAN>0) begin
             // first filtered zero = leading_ones; last_one_end is exclusive.
-            // Register the bounded-span decision before status decoding.
-            transition_span_ok<=(last_one_end-leading_ones)<=SPAN_LIMIT;
-            decode_pending<=1;
+            // V16: separate subtraction and comparison. The combined path
+            // failed routed V15 setup at 250 MHz. Unsigned wrap still rejects
+            // a negative span exactly as before; validity is not relaxed.
+            transition_span<=last_one_end-leading_ones;
+            span_pending<=1;
           end else begin
             busy_o <= 1'b0;
             done_o <= 1'b1;
@@ -260,6 +266,10 @@ module tdc_thermometer_encoder #(
                         ((!captured_all_zero && !captured_all_one &&
                           !multiple_transitions) ? STATUS_VALID : 8'h00);
           end
+        end
+        if (span_pending) begin
+          transition_span_ok<=transition_span<=SPAN_LIMIT;
+          span_pending<=0; decode_pending<=1;
         end
         if (decode_pending) begin
           busy_o<=0; done_o<=1; decode_pending<=0;

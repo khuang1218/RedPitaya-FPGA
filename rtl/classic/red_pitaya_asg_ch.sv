@@ -453,13 +453,16 @@ rp_asg_axi #(
 );
 endmodule
 
-// Short carry-select groups bound the pointer feedback carry depth.
+// V17: shorter local adders and a logarithmic group-carry prefix replace
+// the serial group-carry chain. Same combinational sum and cycle behavior.
 module rp_asg_pointer_add #(
   parameter integer WIDTH=63,
-  parameter integer GROUP=16,
+  parameter integer GROUP=8,
   parameter integer COUNT=(WIDTH+GROUP-1)/GROUP
 )(input wire [WIDTH-1:0] a_i, b_i, output wire [WIDTH-1:0] sum_o);
   wire [COUNT:0] carry;
+  localparam integer LEVELS=$clog2(COUNT);
+  wire [COUNT-1:0] generates[0:LEVELS], propagates[0:LEVELS];
   assign carry[0]=1'b0;
   genvar g;
   generate for (g=0;g<COUNT;g=g+1) begin : gen_group
@@ -467,7 +470,21 @@ module rp_asg_pointer_add #(
     (* KEEP="TRUE" *) wire [W:0] sum_zero, sum_one;
     assign sum_zero={1'b0,a_i[g*GROUP +: W]}+{1'b0,b_i[g*GROUP +: W]};
     assign sum_one={1'b0,a_i[g*GROUP +: W]}+{1'b0,b_i[g*GROUP +: W]}+1'b1;
-    assign carry[g+1]=sum_zero[W] | ((&sum_zero[W-1:0]) && carry[g]);
+    assign generates[0][g]=sum_zero[W];
+    assign propagates[0][g]=&sum_zero[W-1:0];
+    assign carry[g+1]=generates[LEVELS][g];
     assign sum_o[g*GROUP +: W]=carry[g] ? sum_one[W-1:0] : sum_zero[W-1:0];
+  end endgenerate
+  generate for(genvar level=0;level<LEVELS;level=level+1) begin:gen_prefix
+    for(genvar index=0;index<COUNT;index=index+1) begin:gen_lane
+      if(index>=(1<<level)) begin:merge
+        assign generates[level+1][index]=generates[level][index] |
+          (propagates[level][index]&generates[level][index-(1<<level)]);
+        assign propagates[level+1][index]=propagates[level][index]&propagates[level][index-(1<<level)];
+      end else begin:passthrough
+        assign generates[level+1][index]=generates[level][index];
+        assign propagates[level+1][index]=propagates[level][index];
+      end
+    end
   end endgenerate
 endmodule

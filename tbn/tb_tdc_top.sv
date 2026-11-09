@@ -122,8 +122,10 @@ module tb_tdc_top;
     // Exercise an input transition after the UNISIM buffer initializes.
     #1; return_p=1; #1; return_p=0;
     #118; rstn=1; repeat(8) @(negedge clk);
-    rd(0,value); if(value!==32'h5444430e) $fatal(1,"ID mismatch");
-    rd(16'h90,value); if(value!=0) $fatal(1,"Default source is not LVDS");
+    rd(0,value); if(value!==32'h54444312) $fatal(1,"ID mismatch");
+    rd(16'h90,value); if(value!=1) $fatal(1,"Default source is not SINGLE");
+    // Retain the legacy LVDS coverage through explicit source selection.
+    wr(16'h90,0);
     reject_input(2);
     rd(16'h18,value); if(value!=16) $fatal(1,"Tap count mismatch");
     // A result can finish long before a wide launch does. Continuous mode

@@ -1,7 +1,8 @@
 `timescale 1ns/1ps
 // PCB pulse-width acquisition. A small raw-frame ring feeds an online encoder;
 // compact results remain in BRAM for the whole 16384-pulse finite burst.
-// V14 (v12 capture + programmable frame offset): <= 2 MHz frame trigger, 250 MHz sampler, >= 8 ns HIGH/LOW for
+// V18: V17's 25 MHz capture datapath retained; targeted control fanout hints.
+// 250 MHz sampler, >= 8 ns HIGH/LOW for
 // reliable coarse edge detection. Shorter pulses/gaps are not guaranteed.
 // Carry codes are diagnostic until separate rise/fall LUTs are calibrated.
 // Operating timing contract: cycle_start_i defines one frame per FPGA launch
@@ -18,8 +19,7 @@ module tdc_pulse_width #(
   parameter int unsigned DEPTH = 16384,
   parameter int unsigned AW = $clog2(DEPTH),
   parameter int unsigned STAGING_DEPTH = 4,
-  parameter int unsigned SAW = $clog2(STAGING_DEPTH),
-  parameter int unsigned ENCODER_TAPS_PER_CYCLE = 8
+  parameter int unsigned SAW = $clog2(STAGING_DEPTH)
 )(
   input logic bus_clk_i, fast_clk_i, rstn_i,
   input logic event_i, cycle_start_i,
@@ -35,14 +35,11 @@ module tdc_pulse_width #(
     EXTRA_EDGES=16, TRIGGER_TIMEOUT=32, FINE_INVALID=128, COARSE_ONLY=256,
     CAL_USED=512, BOUNDARY=1024, SATURATED=2048, OUT_OF_RANGE=4096;
   localparam logic [31:0] DONE=8, TIMEOUT=16, RATE_ERROR=32, ABORTED=64, OVERFLOW=128;
-  // Both edges encode concurrently. Reserve 32 clocks beyond the scan for
-  // fetch, encoder drain, LUT/arithmetic and retirement. The default 125-clock
-  // (500 ns) frame leaves margin; larger parameterized scans lower the limit.
-  localparam int unsigned ENCODER_SCAN_CYCLES=
-    (NUM_TAPS+ENCODER_TAPS_PER_CYCLE-1)/ENCODER_TAPS_PER_CYCLE;
-  localparam int unsigned PROCESS_BUDGET=ENCODER_SCAN_CYCLES+32;
-  localparam logic [31:0] TICK_PS=4000,
-    MIN_PERIOD=2*((PROCESS_BUDGET>125) ? PROCESS_BUDGET : 125);
+  // A registered encoder tree accepts overlapping frames. Raw-frame fetch
+  // and the nine-clock result arithmetic are independent. The minimum is an
+  // initiation interval, not total latency: 10 fast clocks /40 ns /25 MHz.
+  localparam int unsigned ENCODER_LATENCY=$clog2(NUM_TAPS)+3;
+  localparam logic [31:0] TICK_PS=4000, MIN_PERIOD=20; // pulse units:2 ns
   localparam int unsigned RECORD_W=81+2*INDEX_W;
 
   logic [31:0] requested_count, timeout_cfg, timeout_match_cfg;
@@ -109,8 +106,8 @@ module tdc_pulse_width #(
     end
   end
 
-  // Four in-flight frames only. Retaining 512-bit snapshots for all 16384
-  // pulses would exceed Z7020 BRAM capacity. These shallow memories use LUTs.
+  // Four raw frames staged; more encoded metadata may be in flight. Retaining
+  // 512-bit snapshots for all16384 pulses would exceed Z7020 BRAM capacity.
   (* RAM_STYLE="DISTRIBUTED" *) logic [NUM_TAPS-1:0] rise_memory [0:STAGING_DEPTH-1];
   (* RAM_STYLE="DISTRIBUTED" *) logic [NUM_TAPS-1:0] fall_memory [0:STAGING_DEPTH-1];
   // Keep edge timestamps, rather than a subtraction result, on the capture
@@ -127,6 +124,17 @@ module tdc_pulse_width #(
   localparam int unsigned BANK_COUNT=(DEPTH+BANK_DEPTH-1)/BANK_DEPTH;
   localparam int unsigned READ_GROUPS=(BANK_COUNT+3)/4;
   logic record_write_en;
+  // Sparse absolute edge timestamps cover the entire burst without widening
+  // all16384 compact records. Every64th record (including record0) is saved;
+  // default256x64bits (physical BRAM packing is width-dependent). These are
+  // diagnostic clock ticks, not
+  // pin-delay-calibrated time. Existing six-field records remain unchanged.
+  localparam int unsigned DIAG_SHIFT=6, DIAG_STRIDE=1<<DIAG_SHIFT;
+  localparam int unsigned DIAG_DEPTH=(DEPTH+DIAG_STRIDE-1)/DIAG_STRIDE;
+  localparam int unsigned DIAG_AW=(DIAG_DEPTH>1) ? $clog2(DIAG_DEPTH) : 1;
+  (* RAM_STYLE="BLOCK" *) logic [63:0] diagnostic_memory [0:DIAG_DEPTH-1];
+  logic [63:0] diagnostic_write_data, diagnostic_bus_q;
+  logic [DIAG_AW-1:0] diagnostic_read_addr;
   logic [AW-1:0] record_write_addr;
   logic [RECORD_W-1:0] record_write_data;
   wire [RECORD_W-1:0] record_bank_q [0:BANK_COUNT-1];
@@ -240,7 +248,10 @@ module tdc_pulse_width #(
     valid_read=1;
     case(offset)
       8'h00,8'h08,8'h0c,8'h10,8'h14,8'h18,8'h2c,8'h30,
-      8'h38,8'h3c,8'h40,8'h44,8'h48,8'h58,8'h5c: begin end
+      8'h38,8'h3c,8'h40,8'h44,8'h48,8'h58,8'h5c,8'h60,8'h64: begin end
+      8'h68,8'h6c:
+        valid_read=!busy_o && read_index<completed_bus &&
+          ((32'(read_index)&(DIAG_STRIDE-1))==0);
       8'h1c,8'h20,8'h24,8'h28,8'h34:
         valid_read=!busy_o && (read_index<completed_bus);
       default: valid_read=0;
@@ -345,6 +356,10 @@ module tdc_pulse_width #(
         8'h48: sys_rdata_o<={31'd0,(&read_ready_pipe) && !busy_o};
         8'h58: sys_rdata_o<={14'd0,frame_offset_cfg,2'b0}; // ns
         8'h5c: sys_rdata_o<=32'h4652_4d01; // FRM v1, fixed frame offset
+        8'h60: sys_rdata_o<=32'h4442_4701; // DBG v1, sparse edge timestamps
+        8'h64: sys_rdata_o<=DIAG_STRIDE;
+        8'h68: sys_rdata_o<=diagnostic_bus_q[31:0];
+        8'h6c: sys_rdata_o<=diagnostic_bus_q[63:32];
         default: sys_rdata_o<=0;
       endcase
     end
@@ -396,18 +411,18 @@ module tdc_pulse_width #(
   end
 
   typedef enum logic [1:0] {IDLE,WAIT_TRIGGER,CAPTURE,DRAIN} state_t;
-  state_t state;
+  (* MAX_FANOUT=32 *) state_t state;
   typedef enum logic [3:0] {P_IDLE,FETCH,FETCH_WAIT,DIFF_LOW,DIFF_HIGH,
                             R_START,R_WAIT,SCALE,CORRECT,DELTA_LOW,DELTA_HIGH,
                             ADD_FINE,CHECK_RANGE,CALCULATE} process_state_t;
   process_state_t process_state;
   assign capturing=(state==WAIT_TRIGGER)||(state==CAPTURE);
-  assign processing=(process_state!=P_IDLE);
   logic request_seen, use_lut;
   // Counts never exceed DEPTH. target_count is the number of frames still
   // to close, so capture enables need only a zero/one comparison, not a
   // 32-bit increment/compare chain on the raw-RAM write-enable path.
-  logic [AW:0] target_count, captured_count, processed_count;
+  logic [AW:0] target_count, captured_count, processed_count, dispatched_count;
+  assign processing=(process_state!=P_IDLE) || (dispatched_count!=processed_count);
   logic last_frame;
   // The source period is committed before a pulse marker reaches capture.
   // Register its legality locally instead of comparing 32 remote period bits
@@ -423,13 +438,31 @@ module tdc_pulse_width #(
   assign watchdog_expired=&watchdog_match;
   logic watchdog_carry8, watchdog_carry16, watchdog_carry24;
   logic [AW-1:0] capture_index, process_index;
+  (* MAX_FANOUT=64 *) logic [AW-1:0] dispatch_index;
   wire [SAW-1:0] capture_slot=SAW'(capture_index);
-  wire [SAW-1:0] process_slot=SAW'(process_index);
+  wire [SAW-1:0] process_slot=SAW'(dispatch_index);
   localparam int unsigned OCC_W=$clog2(STAGING_DEPTH+1);
-  logic [OCC_W-1:0] staging_used;
+  (* MAX_FANOUT=32 *) logic [OCC_W-1:0] staging_used;
   wire staging_full=(staging_used >= STAGING_DEPTH-1);
-  wire start_request=(state==IDLE && request_sync[1]!=request_seen);
-  wire abort_pending=(abort_sync[1]!=abort_seen);
+  // Decode each stable mailbox toggle before its wide synchronous reset/CE
+  // fanout. V14's request_sync/request_seen -> decode -> result-control paths
+  // failed routed setup by up to 39 ps. A command costs one extra fast clock;
+  // physical edge samples, timestamps and frame markers are not retimed.
+  // The self-inhibit prevents replay while *_seen updates on the consume edge,
+  // including CLEAR, illegal offset and an abort coincident with a request.
+  (* DONT_TOUCH="TRUE" *) logic start_request, abort_pending, abort_has_work;
+  always_ff @(posedge fast_clk_i) begin
+    if (!capture_rstn) begin start_request<=0; abort_pending<=0; abort_has_work<=0; end
+    else begin
+      start_request<=state==IDLE && request_sync[1]!=request_seen && !start_request &&
+        abort_sync[1]==abort_seen && !abort_pending;
+      abort_pending<=abort_sync[1]!=abort_seen && !abort_pending;
+      // Freeze the abort's pending-work decision alongside its strobe. Leaving
+      // this comparison in the consume branch would retain the original
+      // request_sync/request_seen -> completed_fast reset path through ABORT.
+      abort_has_work<=state!=IDLE || request_sync[1]!=request_seen;
+    end
+  end
   // This output replaces only the original second marker FF. At offset=0
   // its sampling latency is identical; raw edge timestamps are not retimed.
   tdc_frame_delay i_frame_delay (
@@ -452,25 +485,36 @@ module tdc_pulse_width #(
     fall_encoder_raw<=fall_q;
     encoder_rstn<=process_rstn && state!=IDLE && !abort_pending && !start_request;
   end
-  logic [95:0] meta_q;
-  wire [31:0] meta_flags=meta_q[95:64];
-  wire [31:0] meta_rise_tick=meta_q[31:0];
-  wire [31:0] meta_fall_tick=meta_q[63:32];
+  logic [95:0] meta_q, result_meta, dispatch_meta;
+  logic encoder_start, rise_encoder_done, fall_encoder_done;
+  logic [95:0] encode_meta_pipe[0:ENCODER_LATENCY-1];
+  logic [ENCODER_LATENCY-1:0] encode_valid_pipe;
+  wire [31:0] meta_flags=result_meta[95:64];
+  wire [31:0] meta_rise_tick=result_meta[31:0];
+  wire [31:0] meta_fall_tick=result_meta[63:32];
+  // Metadata follows the exact encoder validity latency. Never use the live
+  // ring RAM output for a result after a newer frame has been dispatched.
+  always_ff @(posedge fast_clk_i) begin
+    if(!encoder_rstn) encode_valid_pipe<=0;
+    else encode_valid_pipe<={encode_valid_pipe[ENCODER_LATENCY-2:0],encoder_start};
+    encode_meta_pipe[0]<=dispatch_meta;
+    for(int stage=1;stage<ENCODER_LATENCY;stage=stage+1)
+      encode_meta_pipe[stage]<=encode_meta_pipe[stage-1];
+  end
   logic [16:0] coarse_low;
   logic [31:0] coarse_ticks;
 
-  logic encoder_start, rise_encoder_done, fall_encoder_done;
   logic [INDEX_W-1:0] rise_encoder_index, fall_encoder_index, rise_index, fall_index;
   logic [7:0] rise_encoder_status, fall_encoder_status, rise_status, fall_status;
-  tdc_thermometer_encoder #(.NUM_TAPS(NUM_TAPS),.INDEX_W(INDEX_W),
-    .TAPS_PER_CYCLE(ENCODER_TAPS_PER_CYCLE),.MAX_TRANSITION_SPAN(8)) i_rise_encoder (
+  tdc_population_pipeline #(.NUM_TAPS(NUM_TAPS),.INDEX_W(INDEX_W),
+    .MAX_TRANSITION_SPAN(8)) i_rise_encoder (
     .clk_i(fast_clk_i),.rstn_i(encoder_rstn),.start_i(encoder_start),
-    .raw_taps_i(rise_encoder_raw),.busy_o(),.done_o(rise_encoder_done),
+    .raw_taps_i(rise_encoder_raw),.done_o(rise_encoder_done),
     .fine_index_o(rise_encoder_index),.status_o(rise_encoder_status));
-  tdc_thermometer_encoder #(.NUM_TAPS(NUM_TAPS),.INDEX_W(INDEX_W),
-    .TAPS_PER_CYCLE(ENCODER_TAPS_PER_CYCLE),.MAX_TRANSITION_SPAN(8)) i_fall_encoder (
+  tdc_population_pipeline #(.NUM_TAPS(NUM_TAPS),.INDEX_W(INDEX_W),
+    .MAX_TRANSITION_SPAN(8)) i_fall_encoder (
     .clk_i(fast_clk_i),.rstn_i(encoder_rstn),.start_i(encoder_start),
-    .raw_taps_i(fall_encoder_raw),.busy_o(),.done_o(fall_encoder_done),
+    .raw_taps_i(fall_encoder_raw),.done_o(fall_encoder_done),
     .fine_index_o(fall_encoder_index),.status_o(fall_encoder_status));
 
   function automatic logic [31:0] finish_flags(
@@ -621,7 +665,17 @@ module tdc_pulse_width #(
       record_write_addr<=process_index;
       record_write_data<={result_flags[9] ? fine_delta : 17'sd0,
         fall_index,rise_index,coarse_ticks,result_flags};
+      diagnostic_write_data<={meta_fall_tick,meta_rise_tick};
     end
+  end
+
+  always_ff @(posedge fast_clk_i) begin
+    if (record_write_en && ((32'(record_write_addr)&(DIAG_STRIDE-1))==0))
+      diagnostic_memory[DIAG_AW'(record_write_addr>>DIAG_SHIFT)]<=diagnostic_write_data;
+  end
+  always_ff @(posedge bus_clk_i) begin
+    diagnostic_read_addr<=DIAG_AW'(read_index>>DIAG_SHIFT);
+    diagnostic_bus_q<=diagnostic_memory[diagnostic_read_addr];
   end
 
   // Compare the wide counters before the completion-control fanout. DRAIN
@@ -636,7 +690,36 @@ module tdc_pulse_width #(
   // Track the small staging occupancy directly instead of subtracting the
   // full acquisition counters in a capture write-enable expression.
   wire close_frame=(state==CAPTURE) && (marker_d || watchdog_expired);
-  wire retire_frame=(process_state==CALCULATE);
+  typedef enum logic [1:0] {FS_IDLE,FS_WAIT0,FS_WAIT1,FS_DISPATCH} fetch_state_t;
+  fetch_state_t fetch_state;
+  wire retire_frame=(fetch_state==FS_DISPATCH);
+  wire pipeline_fault=encoder_rstn &&
+    ((rise_encoder_done!=encode_valid_pipe[ENCODER_LATENCY-1]) ||
+     (fall_encoder_done!=encode_valid_pipe[ENCODER_LATENCY-1]) ||
+     (rise_encoder_done && process_state!=P_IDLE));
+  // Release each raw ring slot after copying it into the encoder input, not
+  // after its result retires. This allows multiple encoded frames in flight.
+  // The wait stages cover capture write pipelines and synchronous ring reads.
+  always_ff @(posedge fast_clk_i) begin
+    if(!process_rstn || start_request || abort_pending || state==IDLE) begin
+      fetch_state<=FS_IDLE;dispatch_index<=0;dispatched_count<=0;encoder_start<=0;
+    end else begin
+      encoder_start<=0;
+      case(fetch_state)
+        FS_IDLE: if(staging_used!=0) fetch_state<=FS_WAIT0;
+        FS_WAIT0: fetch_state<=FS_WAIT1;
+        FS_WAIT1: fetch_state<=FS_DISPATCH;
+        FS_DISPATCH: begin
+          dispatch_meta<=meta_q;
+          encoder_start<=1;
+          dispatch_index<=dispatch_index+1'b1;
+          dispatched_count<=dispatched_count+1'b1;
+          fetch_state<=FS_IDLE;
+        end
+        default: fetch_state<=FS_IDLE;
+      endcase
+    end
+  end
   always_ff @(posedge fast_clk_i) begin
     if (!capture_rstn) staging_used<=0;
     else if (start_request || abort_pending || state==IDLE) staging_used<=0;
@@ -762,13 +845,18 @@ module tdc_pulse_width #(
         end
         default: begin end
       endcase
+      // A missing/extra encoder completion or result overlap is fatal. Never
+      // publish a plausible partial burst after metadata/code misassociation.
+      if(pipeline_fault && state!=IDLE && !start_request) begin
+        completed_fast<=0;flags_fast<=DONE|OVERFLOW;state<=IDLE;ack_toggle<=request_seen;
+      end
       if (frame_offset_overrun && capturing) begin
         completed_fast<=0; flags_fast<=DONE|RATE_ERROR;
         state<=IDLE; ack_toggle<=request_seen;
       end
       if (abort_pending) begin
         abort_seen<=abort_sync[1];
-        if (state!=IDLE || request_sync[1]!=request_seen) begin
+        if (abort_has_work) begin
           state<=IDLE; completed_fast<=0; flags_fast<=DONE|ABORTED;
           request_seen<=request_sync[1]; ack_toggle<=request_sync[1];
         end
@@ -776,53 +864,34 @@ module tdc_pulse_width #(
     end
   end
 
-  // Consume CLOSED frames while the producer captures subsequent pulses.
-  // Parallel 512-tap / 8-tap-per-clock encoders fit inside a 500 ns frame.
-  // A ring-overrun guard prevents silently overwriting an old frame.
+  // Encoder latency can exceed one frame. Its fixed-latency stream feeds
+  // result arithmetic with initiation interval 10 clocks, independently of
+  // fetch/capture. Two LUT settling clocks precede the fine subtraction.
   always_ff @(posedge fast_clk_i) begin
-    if (!process_rstn) begin
+    if (!process_rstn || start_request || abort_pending || state==IDLE) begin
       process_state<=P_IDLE; process_index<=0; processed_count<=0;
-      encoder_start<=0; rise_index<=0; fall_index<=0;
-      rise_status<=0; fall_status<=0;
+      rise_index<=0; fall_index<=0; rise_status<=0; fall_status<=0;
       coarse_ps<=0; fine_delta<=0; fine_delta_low<=0; fine_width<=0;
       fine_in_range<=0; coarse_in_range<=0;
       coarse_low<=0; coarse_ticks<=0; coarse_base<=0; coarse_sub<=0;
-    end else if (start_request || abort_pending || state==IDLE) begin
-      process_state<=P_IDLE; process_index<=0; processed_count<=0;
-      encoder_start<=0; rise_index<=0; fall_index<=0;
-      rise_status<=0; fall_status<=0;
-      coarse_ps<=0; fine_delta<=0; fine_delta_low<=0; fine_width<=0;
-      fine_in_range<=0; coarse_in_range<=0;
-      coarse_low<=0; coarse_ticks<=0; coarse_base<=0; coarse_sub<=0;
+      result_meta<=0;
     end else begin
-      encoder_start<=0;
       case(process_state)
-        // While idle, the staging occupancy is exactly the queued-frame count.
-        // Avoid the wide acquisition-counter comparison on state enables.
-        P_IDLE: if (staging_used!=0) process_state<=FETCH;
-        FETCH: begin
-          rise_status<=0; fall_status<=0; rise_index<=0; fall_index<=0;
-          process_state<=FETCH_WAIT;
-        end
-        FETCH_WAIT: process_state<=DIFF_LOW;
-        DIFF_LOW: begin
-          coarse_low<={1'b0,meta_fall_tick[15:0]}-{1'b0,meta_rise_tick[15:0]};
+        P_IDLE: if(rise_encoder_done && fall_encoder_done) begin
+          result_meta<=encode_meta_pipe[ENCODER_LATENCY-1];
+          coarse_low<={1'b0,encode_meta_pipe[ENCODER_LATENCY-1][47:32]}-
+                      {1'b0,encode_meta_pipe[ENCODER_LATENCY-1][15:0]};
+          // Missing/invalid frame snapshots are not interpreted as fine codes.
+          if(encode_meta_pipe[ENCODER_LATENCY-1][64]) begin
+            rise_index<=rise_encoder_index;fall_index<=fall_encoder_index;
+            rise_status<=rise_encoder_status;fall_status<=fall_encoder_status;
+          end else begin
+            rise_index<=0;fall_index<=0;rise_status<=0;fall_status<=0;
+          end
           process_state<=DIFF_HIGH;
         end
         DIFF_HIGH: begin
-          // The seventeenth low bit is the unsigned borrow. Subtract modulo
-          // 2^32 so an interval spanning timestamp wrap is still exact.
-          coarse_ticks<={16'(meta_fall_tick[31:16]-meta_rise_tick[31:16]-coarse_low[16]),
-                         coarse_low[15:0]};
-          process_state<=R_START;
-        end
-        R_START: if (!meta_flags[0]) process_state<=SCALE;
-          else begin encoder_start<=1; process_state<=R_WAIT; end
-        // Identical encoder parameters/start/reset give identical completion
-        // latency; indices/statuses are captured together for this frame.
-        R_WAIT: if (rise_encoder_done && fall_encoder_done) begin
-          rise_index<=rise_encoder_index; rise_status<=rise_encoder_status;
-          fall_index<=fall_encoder_index; fall_status<=fall_encoder_status;
+          coarse_ticks<={16'(meta_fall_tick[31:16]-meta_rise_tick[31:16]-coarse_low[16]),coarse_low[15:0]};
           process_state<=SCALE;
         end
         SCALE: begin
@@ -830,38 +899,25 @@ module tdc_pulse_width #(
           coarse_sub<=(44'(coarse_ticks)<<6)+(44'(coarse_ticks)<<5);
           process_state<=CORRECT;
         end
-        CORRECT: begin
-          coarse_ps<=coarse_base-coarse_sub;
-          // Both indices changed at R_WAIT. This extra state also allows the
-          // two RAM-read stages to settle before consuming the local outputs.
-          process_state<=DELTA_LOW;
-        end
+        CORRECT: begin coarse_ps<=coarse_base-coarse_sub;process_state<=DELTA_LOW;end
         DELTA_LOW: begin
           fine_delta_low<={1'b0,rise_lut_local[7:0]}-{1'b0,fall_lut_local[7:0]};
           process_state<=DELTA_HIGH;
         end
         DELTA_HIGH: begin
-          fine_delta<={9'({1'b0,rise_lut_local[15:8]}-
-                         {1'b0,fall_lut_local[15:8]}-fine_delta_low[8]),
-                       fine_delta_low[7:0]};
+          fine_delta<={9'({1'b0,rise_lut_local[15:8]}-{1'b0,fall_lut_local[15:8]}-fine_delta_low[8]),fine_delta_low[7:0]};
           process_state<=ADD_FINE;
         end
         ADD_FINE: begin
-          fine_width<=$signed({1'b0,coarse_ps})+
-            $signed({{28{fine_delta[16]}},fine_delta});
+          fine_width<=$signed({1'b0,coarse_ps})+$signed({{28{fine_delta[16]}},fine_delta});
           process_state<=CHECK_RANGE;
         end
         CHECK_RANGE: begin
-          // For a nonnegative 32-bit result all upper bits, including the
-          // signed result's sign bit, must be zero. Register these reductions
-          // before flag decoding and the result-data write/reset muxes.
-          fine_in_range<=~|fine_width[44:32];
-          coarse_in_range<=~|coarse_ps[43:32];
+          fine_in_range<=~|fine_width[44:32];coarse_in_range<=~|coarse_ps[43:32];
           process_state<=CALCULATE;
         end
         CALCULATE: begin
-          processed_count<=processed_count+1'b1;
-          process_index<=process_index+1'b1;
+          processed_count<=processed_count+1'b1;process_index<=process_index+1'b1;
           process_state<=P_IDLE;
         end
         default: process_state<=P_IDLE;

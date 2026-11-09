@@ -4,6 +4,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 module tdc_registers #(
+  parameter logic [7:0] VERSION = 8'd18,
   parameter int unsigned NUM_TAPS = 512,
   parameter int unsigned INDEX_W  = $clog2(NUM_TAPS),
   parameter int unsigned FIFO_AW  = 8
@@ -79,7 +80,7 @@ module tdc_registers #(
   input  logic                    calibration_complete_i
 );
 
-  localparam logic [31:0] TDC_ID_VERSION = 32'h5444_430e; // "TDC", v14: v12 capture with fixed frame offset
+  localparam logic [31:0] TDC_ID_VERSION = (VERSION==8'd18 ? 32'h5444_4312 : {24'h544443, VERSION}); // "TDC", V18: SINGLE default, targeted timing repair
 
   localparam logic [15:0] REG_ID_VERSION       = 16'h0000;
   localparam logic [15:0] REG_CONTROL          = 16'h0004;
@@ -194,7 +195,7 @@ module tdc_registers #(
   always_ff @(posedge clk_i) begin
     if (!rstn_i) begin
       control_reg                 <= 32'd0;
-      single_ended_select_o       <= 1'b0;
+      single_ended_select_o       <= 1'b1;
       launch_period_reg           <= 32'd125000;
       launch_width_reg            <= 32'd2;
       timeout_cycles_reg          <= 32'd125000;

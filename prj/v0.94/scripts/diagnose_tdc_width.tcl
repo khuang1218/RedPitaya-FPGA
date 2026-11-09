@@ -44,8 +44,12 @@ set tdc_diag_sdf [get_cells -quiet -hierarchical -filter {NAME =~ *i_butterfly_s
 set tdc_diag_legacy [get_cells -quiet -hierarchical -regexp {.*i_tdc/(product(00|01|10|11|_sum_a|_sum_b)|fine_product_(lo|hi)|approximate_fine_product|coarse_time_product|selected_fine_ps|total_low|calculated_total_ps|last_total_ps)_reg.*}]
 set tdc_diag_lut [get_cells -quiet -hierarchical -filter {(NAME =~ *i_tdc/i_width/rise_lut* || NAME =~ *i_tdc/i_width/fall_lut*) && IS_PRIMITIVE == 1}]
 set tdc_diag_response [get_cells -quiet -hierarchical -regexp {.*reg_response_reg.*}]
-set tdc_diag_control [get_cells -quiet -hierarchical -regexp {.*i_tdc/i_width/(lut_written|lut_group_ready|lut_ready|drain_ready|watchdog_match|staging_used|timeout_match_active|timeout_immediate)_reg.*}]
+set tdc_diag_control [get_cells -quiet -hierarchical -regexp {.*i_tdc/i_width/(lut_written|lut_group_ready|lut_ready|drain_ready|watchdog_match|staging_used|timeout_match_active|timeout_immediate|start_request|abort_pending|abort_has_work|request_sync|request_seen|completed_fast|record_write_en|record_write_pending)_reg.*}]
 set tdc_diag_histogram [get_cells -quiet -hierarchical -filter {NAME =~ *i_tdc/i_calibration/histogram* && IS_PRIMITIVE == 1}]
+set tdc_diag_span [get_cells -quiet -hierarchical -regexp {.*i_tdc/i_width/i_(rise|fall)_encoder/(last_one_end|leading_ones|transition_span|transition_span_ok|span_pending|decode_pending|span|span_ok|pop[01]|multi[01]|bubble[01])_reg.*}]
+set tdc_diag_edge_ram [get_cells -quiet -hierarchical -filter {NAME =~ *i_tdc/i_width/diagnostic_memory* && REF_NAME =~ RAMB*}]
+set tdc_diag_edge_regs [get_cells -quiet -hierarchical -regexp {.*i_tdc/i_width/diagnostic_(write_data|read_addr|bus_q)_reg.*}]
+set tdc_diag_axi [get_cells -quiet -hierarchical -filter {NAME =~ *axi_protocol_converter_0/* && IS_PRIMITIVE == 1}]
 
 set tdc_diag_handle [open [file join $tdc_diagnostic_dir collections.txt] w]
 puts $tdc_diag_handle "Design: $tdc_diag_design"
@@ -64,7 +68,9 @@ foreach tdc_diag_pair [list \
   [list legacy_arithmetic $tdc_diag_legacy] [list calibration_RAM $tdc_diag_lut] \
   [list bus_response $tdc_diag_response] \
   [list width_control $tdc_diag_control] \
-  [list encoder $tdc_diag_encoder]] {
+  [list encoder $tdc_diag_encoder] [list encoder_span $tdc_diag_span] \
+  [list edge_diagnostic_RAM $tdc_diag_edge_ram] [list edge_diagnostic_registers $tdc_diag_edge_regs] \
+  [list PS_AXI_converter $tdc_diag_axi]] {
   lassign $tdc_diag_pair tdc_diag_label tdc_diag_cells
   puts $tdc_diag_handle "\n$tdc_diag_label: [llength $tdc_diag_cells]"
   foreach tdc_diag_cell $tdc_diag_cells {
@@ -96,6 +102,12 @@ tdc_diag_report capture_pipeline_to_metadata_RAM -from $tdc_diag_capture_pipe -t
 tdc_diag_report result_RAM_write -from $tdc_diag_record_write -to $tdc_diag_record_ram
 tdc_diag_report result_RAM_read -from $tdc_diag_record_ram -to $tdc_diag_record_read
 tdc_diag_report encoder -from $tdc_diag_encoder -to $tdc_diag_encoder
+tdc_diag_report encoder_span_pipeline -from $tdc_diag_span -to $tdc_diag_span
+tdc_diag_report edge_diagnostic_write -from $tdc_diag_edge_regs -to $tdc_diag_edge_ram
+tdc_diag_report edge_diagnostic_read -from $tdc_diag_edge_ram -to $tdc_diag_edge_regs
+# V15 also failed two ordinary 200 MHz PS AXI wrap-counter paths. Keep these
+# timed. FCLK3 is also the IDELAY reference: do not lower it as a local shortcut.
+tdc_diag_report PS_AXI_converter -from $tdc_diag_axi -to $tdc_diag_axi
 tdc_diag_report width_internal -from $tdc_diag_width -to $tdc_diag_width
 tdc_diag_report timestamp_and_watchdog -from $tdc_diag_timestamps -to $tdc_diag_timestamps
 tdc_diag_report timestamp_to_metadata -from $tdc_diag_timestamps -to $tdc_diag_meta_ram

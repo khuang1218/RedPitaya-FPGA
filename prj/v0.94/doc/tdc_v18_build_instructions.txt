@@ -1,0 +1,89 @@
+V18 external build and validation
+===============================
+
+Source identity: TDC VERSION18 / ID 0x54444312.
+Reset input: SINGLE (DIO2_P/E1 pin7). LVDS remains selectable.
+Sampling: 250 MHz; minimum frame40 ns; capacity16384 records.
+
+October26 timing-repair revision (still VERSION18):
+The first external V18 implementation reached WNS -0.144 ns, TNS -0.155 ns,
+3 setup failures after post-route optimization; hold passed at +0.007 ns.
+Current sources replace the long pulse HIGH comparator with parallel byte
+comparisons, with no added pipeline latency, and restore clock-based ODDR
+SAME_EDGE setup/hold analysis by removing the extra 2.5 ns datapath target.
+The TDC capture RTL is unchanged. Run build_tdc_v18.tcl for a full rebuild to
+apply this revision; resume_tdc_v18.tcl only finishes an existing old route.
+Inspect pulse_oddr_timing.rpt for normal 4 ns setup paths and hold checks;
+closure of these revised sources is not yet verified.
+
+Connectivity: pulse_gen drives DIO1_P/E1 pin5 and supplies cycle_start/period
+to the TDC width engine. WIDTH framing therefore depends on this module even
+when a separate AWG feeds DIO2_P. The legacy TDC differential E3 launch path
+is a separate source. Neither output is the TDC's internal 250 MHz sample clock.
+
+This is source preparation. No V18 bitstream or routed timing result has been
+generated on the development laptop. Build in your existing external Vivado
+2020.1 Z20_G2 project. No board is programmed by the supplied build helper.
+
+1. Preserve the currently working V17 image. Unpack/copy the supplied source
+   bundle into the corresponding repository paths, keeping its directory tree.
+2. Open the existing Vivado project. In its Tcl console, source the build helper:
+
+   source {C:/Users/kairan/vscodeprj/fpgaprj/RedPitaya-FPGA/prj/v0.94/scripts/build_tdc_v18.tcl}
+
+   Adjust only the repository prefix if your build computer uses another path.
+   If the original helper stopped with 'Not started phys_opt_design (Post-Route)'
+   after routing completed, use the corrected helper files and resume without
+   rebuilding synthesis/route:
+
+   source {C:/Users/kairan/vscodeprj/fpgaprj/RedPitaya-FPGA/prj/v0.94/scripts/resume_tdc_v18.tcl}
+
+   Resume only the existing V18 implementation; it does not refresh HDL sources.
+   The helper refreshes project-local source/constraint copies, archives old
+   implementation evidence and rebuilds synthesis/implementation. It requests
+   an installed performance strategy, including post-route physical optimization
+   when available. No global asynchronous clock exemption is added.
+
+3. New reports/checkpoint are under:
+
+   <project-directory>/tdc_v18_reports/<build-timestamp>/
+
+   The helper stops before bitstream generation if setup or hold slack is
+   negative. Inspect timing_summary_routed.rpt, utilization_routed.rpt,
+   drc_routed.rpt and cdc_routed.rpt. A stopped build is not timing closure;
+   retain/share these reports for the next repair. Collection checks validate
+   named constrained primitives but do not replace timing/CDC review.
+
+4. Once setup/hold timing pass, the helper writes red_pitaya_top.bit and its
+   binary companion in the existing impl_1 run directory, normally:
+
+   C:/vivadoprj/RedPitaya-FPGA/prj/v0.94/project/redpitaya.runs/impl_1
+
+   Use your existing red_pitaya_top.bif and bootgen commands unchanged to
+   generate red_pitaya_top.bit.bin. Reports/checkpoint remain in the timestamped
+   report directory. The helper does not reload the FPGA or restart services.
+
+5. Use scpi-tests/tdc_rigol_v18_25mhz_characterisation.ipynb with its helper files.
+   Enter the exact new bitstream identity and routed WNS in configuration.
+   Restart the kernel, run preflight and confirm VERSION18/minimum40. On a
+   freshly loaded V18 image, input_before_setup should be SINGLE. Preflight
+   also explicitly selects SINGLE for reproducibility.
+
+6. Run the input/offset/identity checks and collect new RISE/FALL LUTs. V17 LUTs
+   do not establish calibration for a new implementation. Repeat full-capacity,
+   phase/startup yield and precision/bias checks. The LUT arithmetic and frame
+   offset are applied in FPGA hardware, not per sample by the PC.
+
+V17 evidence supports conditional finite25 MHz bursts, not accurate continuous
+streaming. The accepted full-depth V17 burst had305 ps SD and+2.45 ns bias, and
+required five source starts. Short-pulse means varied by more than2 ns between
+starts. V18 preserves the capture architecture and targets timing; it does not
+claim to have fixed those measurement errors without new hardware evidence.
+
+Future raw retention defaults to complete_only: successful fully complete
+bursts retain CSV/raw diagnostics; partial/failed/DC attempts retain compact
+metadata and all yield/error bookkeeping. Set CAPTURE_RETENTION="all" for
+explicit raw debugging, or "nonzero" to keep partial bursts too.
+
+The existing V16/V17 minimum-period and diagnostic API/SCPI interface remains
+compatible. No new production server command or API ABI is required for V18.

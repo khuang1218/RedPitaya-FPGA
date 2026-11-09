@@ -4,6 +4,7 @@
 
 (* KEEP_HIERARCHY = "TRUE" *)
 module tdc_top #(
+  parameter logic [7:0] VERSION = 8'd18,
   parameter int unsigned NUM_CARRY4 = 128,
   parameter int unsigned NUM_TAPS   = NUM_CARRY4 * 4,
   parameter int unsigned INDEX_W    = $clog2(NUM_TAPS),
@@ -322,6 +323,7 @@ module tdc_top #(
   );
 
   tdc_registers #(
+    .VERSION(VERSION),
     .NUM_TAPS(NUM_TAPS),
     .INDEX_W(INDEX_W),
     .FIFO_AW(FIFO_AW)

@@ -7,7 +7,9 @@ module tdc_carry_chain #(
 )(input clk_i,rstn_i,event_i,output reg [NUM_TAPS-1:0] sampled_taps_o);
   wire [NUM_TAPS-1:0] taps;
   for(genvar i=0;i<NUM_TAPS;i=i+1) begin:g
-    assign #(0.5*(i+1)) taps[i]=event_i;
+    // Production-sized tests need a line longer than4ns but shorter than the
+    // high-rate test period. This is still a uniform ideal model, not silicon.
+    assign #((NUM_TAPS>16 ? 0.02 : 0.5)*(i+1)) taps[i]=event_i;
   end
   always @(posedge clk_i)
     if(!rstn_i) sampled_taps_o<='0;

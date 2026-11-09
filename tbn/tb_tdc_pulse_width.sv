@@ -2,16 +2,19 @@
 module tb_tdc_pulse_width #(
   parameter bit FULL_SIZE=0,
   parameter integer FULL_DEPTH=16384,
-  parameter integer FRAME_FAST_CYCLES=250
+  parameter integer FRAME_FAST_CYCLES=250,
+  parameter bit FULL_FINE=0
 );
   localparam integer TEST_CARRY4=FULL_SIZE ? 128 : 4;
   localparam integer TEST_DEPTH=FULL_SIZE ? FULL_DEPTH : 8;
   reg bus_clk=0,fast_clk=0,rstn=0;
+  bit freeze_fast_clock=0;
   always #4 bus_clk=~bus_clk;
-  always #2 fast_clk=~fast_clk;
+  always #2 if(!freeze_fast_clock) fast_clk=~fast_clk;
   reg [31:0] addr=0,wdata=0,period=2*FRAME_FAST_CYCLES;
   reg wen=0,ren=0,event_signal=0,marker=0,run=0,input_select=0,conflict=0;
   integer bus_hold_cycles=2;
+  integer full_records=TEST_DEPTH;
   wire [31:0] rdata;
   wire ack,err,busy;
   integer phase=0,pattern=0,trigger_number=0;
@@ -36,8 +39,17 @@ module tb_tdc_pulse_width #(
           0: width_value=102; 1: width_value=246;
           2: width_value=502; 3: width_value=802;
         endcase
-        width_value=width_value*FRAME_FAST_CYCLES/250.0;
-        #11; event_signal=1; #(width_value); event_signal=0;
+        if(FULL_SIZE && FRAME_FAST_CYCLES==10) begin
+          case(trigger_number%4)
+            0:width_value=12.2;1:width_value=16.2;
+            2:width_value=20.2;3:width_value=28.2;
+          endcase
+          #3;
+        end else begin
+          width_value=width_value*FRAME_FAST_CYCLES/250.0;
+          #11;
+        end
+        event_signal=1; #(width_value); event_signal=0;
       end
       1: begin end // no response
       2: event_signal=1; // no falling edge, then HIGH at the next cycle
@@ -45,6 +57,7 @@ module tb_tdc_pulse_width #(
                #100;event_signal=1;#102;event_signal=0;end
       4: begin #11;event_signal=1;#0.2;event_signal=0;end
       6: begin #11;event_signal=1;#988;event_signal=0;end // fall at observed boundary
+      7: begin #11;event_signal=1;#996;event_signal=0;end // fall strictly beyond boundary
       default: begin end
     endcase
   end
@@ -106,33 +119,62 @@ module tb_tdc_pulse_width #(
     if(sequence_value!=index+1) $fatal(1,"Sequence mismatch %d %d",sequence_value,index);
     if(flags[0] && flags[8] && ps!=coarse*4000) $fatal(1,"Coarse width mismatch");
   endtask
-  reg [31:0] status,value,flags,ps;
+  reg [31:0] status,value,flags,ps,rise_ticks,fall_ticks,coarse_ticks;
   integer expected_ps;
   initial begin
     if($value$plusargs("BUS_HOLD_CYCLES=%d",bus_hold_cycles)) begin end
+    if($value$plusargs("FULL_RECORDS=%d",full_records)) begin end
+    if(full_records<1 || full_records>TEST_DEPTH) $fatal(1,"FULL_RECORDS out of range");
     if(bus_hold_cycles<1) $fatal(1,"BUS_HOLD_CYCLES must be positive");
     #120;rstn=1;repeat(12) @(negedge bus_clk);
     rd(0,value);if(value!=32'h50574201) $fatal(1,"ID");
     rd(8'h10,value);if(value!=TEST_DEPTH) $fatal(1,"Capacity");
+    rd(8'h44,value);if(value!=40) $fatal(1,"Minimum period %0d",value);
+    rd(8'h60,value);if(value!=32'h44424701) $fatal(1,"Diagnostic feature");
+    rd(8'h64,value);if(value!=64) $fatal(1,"Diagnostic stride");
     if(FULL_SIZE) begin
       // Exercise the production compact BRAM and many staging-ring wraps,
       // rather than only the small controller-test configuration.
       wr(8'h0c,TEST_DEPTH+1,1);
-      arm(TEST_DEPTH,0);wait_done(status);run=0;
+      if(FULL_FINE) begin
+        // Ideal 20 ps/tap model only. Never use these LUTs on hardware.
+        for(integer i=0;i<1024;i=i+1) begin
+          wr(8'h38,i);wr(8'h3c,((i%512)*20>4000) ? 4000 : (i%512)*20);
+        end
+        wr(8'h40,2);
+      end
+      $display("Starting full-size acquisition: %0d requested / %0d storage, fine=%0d",full_records,TEST_DEPTH,FULL_FINE);
+      arm(full_records,0);wait_done(status);run=0;
+      // DONE includes the drain fence. Stop only the testbench fast clock
+      // during readout: all requested frames were captured at full rate.
+      // Bus readout must remain independent of further acquisition clocks.
+      freeze_fast_clock=1;
+      $display("Full-size acquisition drained: %0d records, %0d ns frames",full_records,FRAME_FAST_CYCLES*4);
       if(status!=8 || !saw_overlap) $fatal(1,"Full-size online acquisition status=%h overlap=%b",status,saw_overlap);
-      rd(8'h14,value);if(value!=TEST_DEPTH) $fatal(1,"Full-size count");
-      for(integer i=0;i<TEST_DEPTH;i=i+1) begin
+      rd(8'h14,value);if(value!=full_records) $fatal(1,"Full-size count");
+      for(integer i=0;i<full_records;i=i+1) begin
         record_at(i,flags,ps);
         case((i+1)%4)
           0:expected_ps=102000;1:expected_ps=246000;
           2:expected_ps=502000;3:expected_ps=802000;
         endcase
         expected_ps=expected_ps*FRAME_FAST_CYCLES/250;
-        if(!flags[0]||!flags[8]||ps<expected_ps-4000||ps>expected_ps+4000)
+        if(FRAME_FAST_CYCLES==10) case((i+1)%4)
+          0:expected_ps=12200;1:expected_ps=16200;
+          2:expected_ps=20200;3:expected_ps=28200;
+        endcase
+        if(!flags[0] || (FULL_FINE ? (!flags[9] || flags[8]) : !flags[8]) ||
+           ps<expected_ps-(FULL_FINE ? 40 : 4000) || ps>expected_ps+(FULL_FINE ? 40 : 4000))
           $fatal(1,"Full-size RAM record %d flags=%h ps=%d expected=%d",i,flags,ps,expected_ps);
+        if(i%64==0) begin
+          rd(8'h68,rise_ticks);rd(8'h6c,fall_ticks);rd(8'h24,coarse_ticks);
+          if((fall_ticks-rise_ticks)!==coarse_ticks)
+            $fatal(1,"Sparse timestamps misassociated index=%d rise=%h fall=%h coarse=%h",i,rise_ticks,fall_ticks,coarse_ticks);
+        end else if(i==1) rd(8'h68,value,1);
+        if(i%4096==4095) $display("Checked full-size records through %0d",i+1);
       end
-      wr(8'h18,TEST_DEPTH,1);
-      $display("tb_tdc_pulse_width: PASS (%0d taps / %0d records, %0d ns frames, online encoding, all requested record addresses; ideal delays)",TEST_CARRY4*4,TEST_DEPTH,FRAME_FAST_CYCLES*4);
+      wr(8'h18,full_records,1);
+      $display("tb_tdc_pulse_width: PASS (%0d taps / %0d records / %0d capacity, %0d ns frames, fine=%0d, all records and sparse edge timestamps; ideal delays)",TEST_CARRY4*4,full_records,TEST_DEPTH,FRAME_FAST_CYCLES*4,FULL_FINE);
       $finish;
     end
     wr(8'h0c,0,1);wr(8'h0c,9,1);wr(8'h40,2,1);
@@ -219,15 +261,28 @@ module tb_tdc_pulse_width #(
     end
     arm(2,6);wait_done(status);run=0;
     record_at(0,flags,ps);
-    if(flags[0]||!flags[2]) $fatal(1,"V12 must reject a fall beyond the frame %h",flags);
-    // Stall processing deliberately: the raw ring must flag overflow instead
-    // of overwriting a frame or returning a plausible but corrupt burst.
+    // This waveform lands exactly on the observed boundary. V12/V14 already
+    // recorded the FALL with BOUNDARY and no VALID; do not require NO_FALL.
+    if(flags[0]||!flags[10]||flags[2]) $fatal(1,"Boundary fall flags %h",flags);
+    arm(2,7);wait_done(status);run=0;
+    record_at(0,flags,ps);
+    if(flags[0]||!flags[2]) $fatal(1,"Fall beyond frame must be missing %h",flags);
+    // A missing completion is fatal even after its raw slot has been released
+    // into the overlapping encoder pipeline. Do not publish partial results.
     arm(8,0);force dut.rise_encoder_done=0;force dut.fall_encoder_done=0;
     wait_done(status);run=0;release dut.rise_encoder_done;release dut.fall_encoder_done;
     if(!status[7]) $fatal(1,"Staging overflow was not reported");
     rd(8'h14,value);if(value!=0) $fatal(1,"Overflow exposed partial results");
     arm(1,0);wait_done(status);run=0;record_at(0,flags,ps);
     if(!flags[0] || status[7]) $fatal(1,"Overflow/rearm failed");
+    // Independently stall raw-frame dispatch: the four-slot ring must detect
+    // real producer overrun, without overwriting unconsumed snapshots.
+    arm(8,0);force dut.fetch_state=dut.FS_IDLE;
+    wait_done(status);run=0;release dut.fetch_state;
+    if(!status[7]) $fatal(1,"Raw staging overflow was not reported");
+    rd(8'h14,value);if(value!=0) $fatal(1,"Raw staging overflow exposed results");
+    arm(1,0);wait_done(status);run=0;record_at(0,flags,ps);
+    if(!flags[0] || status[7]) $fatal(1,"Raw overflow/rearm failed");
     wr(8'h04,4);while(busy) @(negedge bus_clk);
     rd(8'h14,value);if(value!=0) $fatal(1,"Clear");
     $display("tb_tdc_pulse_width: PASS (online burst, signed/frozen fine corrections, errors, watchdog, abort, staging overflow, boundary RAM writes, width-first CDC readout; ideal delays)");

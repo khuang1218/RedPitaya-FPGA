@@ -32,8 +32,10 @@ custom_check_count "Width reset synchronizer CLR pins" [get_pins -of_objects [ge
 custom_check_count "Width configuration mailbox" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/(requested_count|timeout_match_cfg|timeout_immediate_cfg|lut_enabled|clear_request|frame_match_cfg|frame_zero_cfg|frame_one_cfg|frame_offset_cfg)_reg(\[[0-9]+\])?}] 1
 custom_check_count "Scope local decimation configuration" [get_cells -quiet -hier -regexp {.*i_scope/.*i_dec/set_dec_local_reg\[[0-9]+\]}] 17
 custom_check_count "Width registered timeout halves" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/watchdog_match_reg\[[01]\]}] 2 2
-custom_check_count "Width population encoder registers" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/i_(rise|fall)_encoder/population_reg\[[0-9]+\]}] 20 20
-custom_check_count "Width bounded transition decisions" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/i_(rise|fall)_encoder/transition_span_ok_reg}] 2 2
+custom_check_count "Width pipelined population registers" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/i_(rise|fall)_encoder/pop1_reg\[[0-9]+\]}] 20 20
+custom_check_count "Width registered encoder tree" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/i_(rise|fall)_encoder/gen_level.*(population|leading|last_end).*reg.*}] 1
+custom_check_count "Width bounded transition decisions" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/i_(rise|fall)_encoder/span_ok_reg}] 2 2
+custom_check_count "Width encoded metadata pipeline" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/encode_meta_pipe.*reg.*}] 1
 custom_check_count "Legacy histogram pipeline" [get_cells -quiet -hier -regexp {.*i_tdc/i_calibration/histogram_(read|write)_pending_reg}] 2 2
 custom_check_count "Width registered completion decision" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/drain_ready_reg.*}] 1
 custom_check_count "Width registered arithmetic ranges" [get_cells -quiet -hier -regexp {.*i_tdc/i_width/(fine_in_range|coarse_in_range)_reg}] 2 2
@@ -42,11 +44,14 @@ foreach pattern {*i_tdc/return_sync_meta_reg/D *i_tdc/i_internal_stimulus/enable
   custom_check_count $pattern [get_pins -quiet -hier -filter "NAME =~ $pattern"] 1 1
 }
 custom_check_count "Pulse first CDC stages" [get_cells -quiet -hier -regexp {.*i_pulse_gen/(request_sync|ack_sync|claim_sync|enable_sync|ready_sync|gpio_data_sync)_reg\[0\]}] 6 6
-custom_check_count "Pulse reset synchronizer CLR pins" [get_pins -of_objects [get_cells -quiet -hier -regexp {.*i_pulse_gen/((bus|fast)_reset_pipe_reg\[[0-2]\]|oddr_rstn_reg)}] -filter {REF_PIN_NAME == CLR}] 7 7
+custom_check_count "Pulse reset synchronizer CLR pins" [get_pins -of_objects [get_cells -quiet -hier -regexp {.*i_pulse_gen/(bus|fast)_reset_pipe_reg\[[0-2]\]}] -filter {REF_PIN_NAME == CLR}] 6 6
+custom_check_count "Pulse asynchronous ODDR reset PRE" [get_pins -of_objects [get_cells -quiet -hier -regexp {.*i_pulse_gen/oddr_reset_reg}] -filter {REF_PIN_NAME == PRE}] 1 1
+custom_check_count "Pulse synchronous reset leaf" [get_cells -quiet -hier -regexp {.*i_pulse_gen/fast_control_rstn_reg}] 1 1
 custom_check_count "TDC reset synchronizer CLR pins" [get_pins -quiet -hier -filter {NAME =~ *i_tdc/i_mmcm_stimulus/test_rstn*_reg/CLR}] 2 2
 custom_check_count "Pulse mailbox" [get_cells -quiet -hier -regexp {.*i_pulse_gen/mailbox_(period|high|last|prelast|enable)_reg(\[[0-9]+\])?}] 1
 custom_check_count "Pulse active values" [get_cells -quiet -hier -regexp {.*i_pulse_gen/active_(period|high|last|prelast|enable)_reg(\[[0-9]+\])?}] 1
-custom_check_count "Pulse registered terminal decision" [get_cells -quiet -hier -regexp {.*i_pulse_gen/phase_last_reg}] 1 1
+custom_check_count "Pulse registered terminal halves" [get_cells -quiet -hier -regexp {.*i_pulse_gen/phase_last_match_reg\[[01]\]}] 2 2
+custom_check_count "Pulse fabric marker registers" [get_cells -quiet -hier -regexp {.*i_pulse_gen/marker_data_reg\[[01]\]}] 2 2
 custom_check_count "Pulse readback" [get_cells -quiet -hier -regexp {.*i_pulse_gen/readback_(period|high)_reg\[[0-9]+\]}] 1
 set custom_bnet_disabled [expr {[lsearch -regexp [get_property verilog_define [get_filesets sources_1]] {^DISABLE_BNET(=|$)}]>=0}]
 if {$custom_bnet_disabled} {

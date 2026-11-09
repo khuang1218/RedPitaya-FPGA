@@ -38,13 +38,18 @@ module pulse_gen #(
     else fast_reset_pipe <= {fast_reset_pipe[1:0], 1'b1};
   wire bus_rstn = bus_reset_pipe[2];
   wire fast_rstn = fast_reset_pipe[2];
-  // Give the ODDR reset its own final stage rather than routing the reset
-  // shared by the counter/mailbox to the IOB. Assertion still works without
-  // a running fast clock; release remains timed to that clock.
-  (* ASYNC_REG = "TRUE" *) logic oddr_rstn;
+  // Active-HIGH registered reset connects directly to the ODDR R pin.
+  // V16's active-low FF plus inverter/routing failed recovery by107 ps.
+  // Assertion still forces LOW even when the fast clock is stopped.
+  (* ASYNC_REG = "TRUE" *) logic oddr_reset;
   always_ff @(posedge fast_clk_i or negedge arstn_i)
-    if (!arstn_i) oddr_rstn <= 1'b0;
-    else oddr_rstn <= fast_rstn;
+    if (!arstn_i) oddr_reset <= 1'b1;
+    else oddr_reset <= !fast_rstn;
+  // Internal controls reset synchronously through a local leaf. The independent
+  // asynchronous IOB reset above retains clock-loss output protection without
+  // timing a high-fanout recovery network to every phase/mailbox register.
+  (* DONT_TOUCH="TRUE" *) logic fast_control_rstn;
+  always_ff @(posedge fast_clk_i) fast_control_rstn<=fast_rstn;
 
   logic [31:0] shadow_period, shadow_high;
   logic shadow_enable, claimed, error_sticky;
@@ -55,6 +60,9 @@ module pulse_gen #(
   logic [31:0] mailbox_last, active_last;
   logic [31:0] mailbox_prelast, active_prelast;
   logic mailbox_enable, request_toggle, ack_toggle;
+  // Predecode the minimum-period case in the bus mailbox. It is stable for
+  // the same request/ack interval as the other bundled timing values.
+  logic mailbox_period_two, active_period_two;
   (* ASYNC_REG = "TRUE" *) logic [1:0] ack_sync, request_sync;
   (* ASYNC_REG = "TRUE" *) logic [1:0] claim_sync, enable_sync, ready_sync;
   logic [31:0] active_period, active_high, readback_period, readback_high;
@@ -94,6 +102,7 @@ module pulse_gen #(
       mailbox_last <= DEFAULT_PERIOD - 32'd2;
       mailbox_prelast <= DEFAULT_PERIOD - 32'd4;
       mailbox_enable <= 1'b0;
+      mailbox_period_two <= 1'b0;
       request_toggle <= 1'b0;
       sys_rdata_o <= '0;
       sys_err_o <= 1'b0;
@@ -150,6 +159,7 @@ module pulse_gen #(
                   mailbox_high <= shadow_high;
                   mailbox_last <= shadow_period - 32'd2;
                   mailbox_prelast <= shadow_period - 32'd4;
+                  mailbox_period_two <= shadow_period == 32'd2;
                   mailbox_enable <= shadow_enable;
                   request_toggle <= ~request_toggle;
                   if (shadow_enable) claimed <= 1'b1;
@@ -167,6 +177,7 @@ module pulse_gen #(
                   mailbox_high <= DEFAULT_HIGH;
                   mailbox_last <= DEFAULT_PERIOD - 32'd2;
                   mailbox_prelast <= DEFAULT_PERIOD - 32'd4;
+                  mailbox_period_two <= 1'b0;
                   mailbox_enable <= 1'b0;
                   request_toggle <= ~request_toggle;
                   claimed <= 1'b0;
@@ -201,18 +212,40 @@ module pulse_gen #(
 
   logic [31:0] phase;
   logic phase_carry8, phase_carry16, phase_carry24;
-  logic phase_last;
+  logic [1:0] phase_last_match;
+  wire phase_last = &phase_last_match;
   logic previous_d2;
   logic [1:0] ddr_data;
+  // Compare the pair index in parallel byte groups instead of one 31/32-bit
+  // carry chain. KEEP preserves the short comparison boundaries through
+  // synthesis. No extra register or waveform/marker latency is introduced.
+  (* KEEP="TRUE" *) wire [3:0] high_less, high_equal;
+  assign high_less[0] = phase[7:1] < active_high[7:1];
+  assign high_equal[0] = phase[7:1] == active_high[7:1];
+  for (genvar group_index=1; group_index<4; group_index=group_index+1) begin : gen_high_compare
+    assign high_less[group_index] = phase[group_index*8 +: 8] < active_high[group_index*8 +: 8];
+    assign high_equal[group_index] = phase[group_index*8 +: 8] == active_high[group_index*8 +: 8];
+  end
+  wire pair_below_high = high_less[3] |
+                        (high_equal[3] && high_less[2]) |
+                        (high_equal[3] && high_equal[2] && high_less[1]) |
+                        (high_equal[3] && high_equal[2] && high_equal[1] && high_less[0]);
+  // phase is even. For odd HIGH, D1 also includes the equal pair; D2 does
+  // not. This shares one bounded comparator between both output halves.
+  wire first_half_high = pair_below_high | ((&high_equal) && active_high[0]);
   // Final pair registers keep the ownership/GPIO mux off the register-to-ODDR
   // path. The extra pipeline clock is matched by the marker and drive guard.
   (* DONT_TOUCH="TRUE" *) logic [1:0] oddr_data;
+  // Keep marker feedback in fabric, independently of the fanout-one launch
+  // registers. The placer can put oddr_data close to ODDR without stretching
+  // the route back to the TDC/phase controls. Identical pipeline latency.
+  (* DONT_TOUCH="TRUE" *) logic [1:0] marker_data;
   logic [2:0] claim_drive_delay;
   (* ASYNC_REG = "TRUE" *) logic [1:0] gpio_data_sync;
   // phase is always even; the two bits represent successive 2 ns intervals.
   // Periods are even, so the pair never straddles a period boundary.
-  always_ff @(posedge fast_clk_i or negedge fast_rstn) begin
-    if (!fast_rstn) begin
+  always_ff @(posedge fast_clk_i) begin
+    if (!fast_control_rstn) begin
       request_sync <= '0;
       claim_sync <= '0;
       claim_drive_delay <= '0;
@@ -221,7 +254,8 @@ module pulse_gen #(
       active_high <= DEFAULT_HIGH;
       active_last <= DEFAULT_PERIOD - 32'd2;
       active_prelast <= DEFAULT_PERIOD - 32'd4;
-      phase_last <= 1'b0;
+      phase_last_match <= '0;
+      active_period_two <= 1'b0;
       active_enable <= 1'b0;
       phase <= '0;
       phase_carry8<=0; phase_carry16<=0; phase_carry24<=0;
@@ -229,7 +263,7 @@ module pulse_gen #(
       gpio_data_sync <= '0;
       previous_d2 <= 1'b0;
     end else begin
-      previous_d2 <= oddr_data[1];
+      previous_d2 <= marker_data[1];
       gpio_data_sync <= {gpio_data_sync[0], gpio_data_i};
       request_sync <= {request_sync[0], request_toggle};
       claim_sync <= {claim_sync[0], claimed};
@@ -239,7 +273,8 @@ module pulse_gen #(
         active_high <= mailbox_high;
         active_last <= mailbox_last;
         active_prelast <= mailbox_prelast;
-        phase_last <= mailbox_last==0;
+        phase_last_match <= {2{mailbox_period_two}};
+        active_period_two <= mailbox_period_two;
         active_enable <= mailbox_enable;
         ack_toggle <= request_sync[1];
         phase <= '0;
@@ -249,20 +284,21 @@ module pulse_gen #(
       // different cycles. Keep phase at zero and ODDR data LOW until the
       // driver guard is complete, so the first physical pulse is a full one.
       end else if (active_enable && claim_sync[1] && claim_drive_delay[2]) begin
-        ddr_data[0] <= phase < active_high;
+        ddr_data[0] <= first_half_high;
         // phase is even: (phase+1)<HIGH is exactly phase/2 < floor(HIGH/2).
         // This removes the adder before the second-half comparator.
-        ddr_data[1] <= phase[31:1] < active_high[31:1];
+        ddr_data[1] <= pair_below_high;
         // Terminal subtraction is done on the 125 MHz bus side, outside
         // this 4 ns counter feedback path.
         // The wide equality is registered one pair early. Keep it out of
         // the phase-counter increment/reset feedback mux at 250 MHz.
         if (phase_last) begin
           phase<='0;
-          phase_last<=active_last==0;
+          phase_last_match<={2{active_period_two}};
           phase_carry8<=0; phase_carry16<=0; phase_carry24<=0;
         end else begin
-          phase_last<=phase==active_prelast;
+          phase_last_match[0]<=phase[15:0]==active_prelast[15:0];
+          phase_last_match[1]<=phase[31:16]==active_prelast[31:16];
           // Prepare byte carries one pair early (FC -> FE -> 00). Avoid a
           // full 31-bit increment in the 250 MHz phase feedback path.
           phase_carry8<=phase[7:0]==8'hfc;
@@ -275,16 +311,19 @@ module pulse_gen #(
         end
       end else begin
         phase <= '0;
-        phase_last<=active_last==0;
+        phase_last_match<={2{active_period_two}};
         phase_carry8<=0; phase_carry16<=0; phase_carry24<=0;
         ddr_data <= '0;
       end
     end
   end
 
-  always_ff @(posedge fast_clk_i or negedge fast_rstn) begin
-    if (!fast_rstn) oddr_data<='0;
-    else oddr_data<=claim_sync[1] ? ddr_data : {2{gpio_data_sync[1]}};
+  always_ff @(posedge fast_clk_i) begin
+    if (!fast_control_rstn) begin oddr_data<='0; marker_data<='0; end
+    else begin
+      oddr_data<=claim_sync[1] ? ddr_data : {2{gpio_data_sync[1]}};
+      marker_data<=claim_sync[1] ? ddr_data : {2{gpio_data_sync[1]}};
+    end
   end
 
   // GPIO/pulse selection is BEFORE ODDR. Its Q must connect directly to the
@@ -293,15 +332,15 @@ module pulse_gen #(
     .Q(pin_data_o), .C(fast_clk_i), .CE(1'b1),
     .D1(oddr_data[0]),
     .D2(oddr_data[1]),
-    .R(!oddr_rstn), .S(1'b0)
+    .R(oddr_reset), .S(1'b0)
   );
   // Let ODDR load LOW for a full fast clock before claiming an input pin.
   // Otherwise a saved HIGH GPIO data bit could leak out during first ON.
   // Release immediately when claim_sync clears, before GPIO passthrough resumes.
-  assign pin_dir_o = (claim_sync[1] && claim_drive_delay[2]) ? 1'b1 : gpio_dir_i;
+  assign pin_dir_o = (fast_rstn && claim_sync[1] && claim_drive_delay[2]) ? 1'b1 : gpio_dir_i;
   // Sampled at fast_clk_i: exactly the D1 edge presented to ODDR on this
   // clock, after the ddr_data pipeline and ownership guard. No pin loopback.
-  assign cycle_start_o = active_enable && claim_sync[1] && claim_drive_delay[2] &&
-                         oddr_data[0] && !previous_d2;
+  assign cycle_start_o = fast_rstn && active_enable && claim_sync[1] && claim_drive_delay[2] &&
+                         marker_data[0] && !previous_d2;
   assign active_period_o = active_period;
 endmodule
